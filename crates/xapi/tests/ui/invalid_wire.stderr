@@ -1,0 +1,5 @@
+error: unsupported wire type
+ --> tests/ui/invalid_wire.rs:6:9
+  |
+6 |     id: i32,
+  |         ^^^

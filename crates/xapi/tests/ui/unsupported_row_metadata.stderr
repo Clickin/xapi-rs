@@ -1,0 +1,5 @@
+error: row_type/org_row fields are represented by Vec<Tracked<Row>> on the root dataset
+ --> tests/ui/unsupported_row_metadata.rs:6:12
+  |
+6 |     state: xapi::RowType,
+  |            ^^^^^^^^^^^^^

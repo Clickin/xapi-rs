@@ -1,0 +1,15 @@
+{
+  "version": "1.0",
+  "Parameters": [{"id": "ErrorCode", "type": "INT", "value": 7}],
+  "Datasets": [{
+    "id": "users",
+    "ColumnInfo": {"Column": [
+      {"id": "id", "size": 10, "type": "INT"},
+      {"id": "name", "size": 50, "type": "STRING"}
+    ]},
+    "Rows": [
+      {"_RowType_": "U", "id": 42, "name": "Ada"},
+      {"_RowType_": "O", "id": 41, "name": "Old"}
+    ]
+  }]
+}

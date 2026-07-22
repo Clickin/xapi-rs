@@ -1,0 +1,30 @@
+[package]
+name = "xapi-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "HTTP helpers for the xapi Rust runtime"
+
+[dependencies]
+base64 = "0.22"
+http.workspace = true
+quick-xml = "0.41"
+serde_json = "1"
+thiserror = "2"
+xapi.workspace = true
+
+[features]
+default = []
+tokio = ["dep:tokio", "dep:tokio-util"]
+
+[dependencies.tokio]
+version = "1"
+features = ["io-util", "macros", "rt", "time"]
+optional = true
+
+[dependencies.tokio-util]
+version = "0.7"
+features = ["io-util"]
+optional = true

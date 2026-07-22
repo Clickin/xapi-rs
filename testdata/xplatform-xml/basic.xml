@@ -1,0 +1,1 @@
+<Root><Parameters><Parameter id="ErrorCode">7</Parameter></Parameters><Datasets><Dataset id="users"><ColumnInfo><Column id="name" type="STRING"/><Column id="id" type="INT"/></ColumnInfo><Rows><Row><Col id="name">Ada</Col><Col id="id">42</Col></Row></Rows></Dataset></Datasets></Root>

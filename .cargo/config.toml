@@ -1,0 +1,12 @@
+[build]
+# Do not let a plain `cargo test` fan out rustc/test jobs on small machines.
+jobs = 1
+
+[env]
+# libtest reads this before command-line arguments; callers can still override
+# it explicitly with `-- --test-threads=N` when they want parallel tests.
+RUST_TEST_THREADS = { value = "1", force = false }
+
+[alias]
+# Keep rustc jobs and libtest threads bounded on small CI/dev machines.
+test-serial = "test --workspace --all-features --jobs 1 -- --test-threads=1"

@@ -1,0 +1,5 @@
+error: size requires a positive integer
+ --> tests/ui/invalid_size.rs:6:9
+  |
+6 |     id: i32,
+  |         ^^^

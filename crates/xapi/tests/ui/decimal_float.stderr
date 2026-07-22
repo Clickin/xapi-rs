@@ -1,0 +1,5 @@
+error: DECIMAL/BIGDECIMAL cannot be mapped to f32/f64 without an explicit precision-loss opt-in
+ --> tests/ui/decimal_float.rs:6:13
+  |
+6 |     amount: f64,
+  |             ^^^

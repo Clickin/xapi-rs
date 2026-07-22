@@ -1,0 +1,5 @@
+error: duplicate or empty column id
+ --> tests/ui/duplicate_column.rs:8:13
+  |
+8 |     second: i32,
+  |             ^^^

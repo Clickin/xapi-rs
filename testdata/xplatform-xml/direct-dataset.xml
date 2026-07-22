@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Root xmlns="http://www.tobesoft.com/platform/Dataset" ver="4000">
+  <Parameters>
+    <Parameter id="ErrorCode" type="INT" value="7"/>
+    <Parameter id="service">stock</Parameter>
+  </Parameters>
+  <Dataset id="users">
+    <ColumnInfo>
+      <Column id="id" size="10" type="INT"/>
+      <Column id="name" size="50" type="STRING"/>
+    </ColumnInfo>
+    <Rows>
+      <Row><Col id="id">42</Col><Col id="name">Ada</Col></Row>
+    </Rows>
+  </Dataset>
+</Root>

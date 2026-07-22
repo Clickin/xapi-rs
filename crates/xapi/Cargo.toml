@@ -1,0 +1,34 @@
+[package]
+name = "xapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Type-safe Rust runtime for XPLATFORM and Nexacro Dataset payloads"
+
+[dependencies]
+base64 = "0.22"
+quick-xml = "0.41"
+serde = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+
+[features]
+default = ["derive"]
+derive = ["dep:xapi-derive"]
+
+[dev-dependencies]
+trybuild = "1"
+
+[[bench]]
+name = "codec"
+harness = false
+
+[[bench]]
+name = "blob"
+harness = false
+
+[dependencies.xapi-derive]
+workspace = true
+optional = true

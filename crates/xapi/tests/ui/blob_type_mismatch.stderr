@@ -1,0 +1,5 @@
+error: BLOB columns require Blob or Vec<u8>, and those types require wire = BLOB
+ --> tests/ui/blob_type_mismatch.rs:6:14
+  |
+6 |     payload: String,
+  |              ^^^^^^
