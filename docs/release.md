@@ -5,7 +5,7 @@ optional `xapi-derive` crate and `xapi-http` depends on `xapi`:
 
 ```text
 cargo publish -p xapi-derive
-cargo publish -p xapi
+cargo publish -p xplatform-dataset
 cargo publish -p xapi-http
 ```
 

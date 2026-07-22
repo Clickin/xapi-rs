@@ -11,7 +11,7 @@ readme = "README.md"
 version = "0.1.0"
 
 [workspace.dependencies]
-xapi = { path = "crates/xapi", version = "0.1.0" }
+xapi = { package = "xplatform-dataset", path = "crates/xapi", version = "0.1.0" }
 xapi-derive = { path = "crates/xapi-derive", version = "0.1.0" }
 xapi-http = { path = "crates/xapi-http", version = "0.1.0" }
 http = "1"
