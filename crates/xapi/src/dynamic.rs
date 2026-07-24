@@ -16,13 +16,27 @@ pub fn decode<R: Read>(
     limits: Limits,
     strict: bool,
 ) -> Result<Document> {
-    crate::from_reader_with_options(reader, format, limits, strict)
+    match format {
+        Format::NexacroBinary5000 | Format::XPlatformBinary5000 => {
+            crate::binary::decode_raw(reader, limits, strict)
+        }
+        Format::XPlatformSsv | Format::NexacroSsv => {
+            crate::ssv::decode_raw(reader, format, limits, strict)
+        }
+        _ => crate::from_reader_with_options(reader, format, limits, strict),
+    }
 }
 
 pub fn encode<W: Write>(writer: W, document: &Document, format: Format) -> Result<()> {
     match format {
-        Format::XPlatformXml4000 | Format::NexacroXml4000 => crate::xml::encode(writer, document),
-        Format::NexacroJson10 => crate::json::encode(writer, document),
+        Format::NexacroBinary5000 | Format::XPlatformBinary5000 => {
+            crate::binary::encode(writer, document)
+        }
+        Format::XPlatformSsv | Format::NexacroSsv => crate::ssv::encode(writer, document, format),
+        Format::XPlatformXml4000 | Format::NexacroXml4000 => {
+            crate::xml::encode_raw(writer, document, format)
+        }
+        Format::NexacroJson10 => crate::json::encode_raw(writer, document),
     }
 }
 
@@ -39,12 +53,21 @@ impl XapiRootDecoder<RawDocument> for Decoder {
             .push((id.to_owned(), value.clone()));
         Ok(())
     }
+    fn parameter_wire(&mut self, wire: Option<WireType>) -> Result<()> {
+        self.document
+            .parameter_wires
+            .push(wire.map(|wire| wire.to_string()));
+        Ok(())
+    }
 
     fn dataset_begin(&mut self, dataset: &str) -> Result<()> {
         self.document.datasets.push(RawDataset {
             id: dataset.to_owned(),
             columns: Vec::new(),
+            column_sizes: Vec::new(),
+            column_meta: Vec::new(),
             const_columns: Vec::new(),
+            const_column_sizes: Vec::new(),
             rows: Vec::new(),
         });
         self.current = Some(self.document.datasets.len() - 1);

@@ -3,13 +3,14 @@ use std::io::{Read, Write};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use quick_xml::{
     escape::unescape,
-    events::{BytesEnd, BytesStart, BytesText, Event},
+    events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event},
     Reader, Writer, XmlVersion,
 };
 
 use crate::{
     optimize_raw, DecodeError, EncodeError, Error, FieldSchema, Format, Limits, RawDataset,
-    RawDocument, RawRow, RawValue, Result, RowType, XapiEncodeSink, XapiRoot, XapiRootDecoder,
+    RawDocument, RawRow, RawValue, Result, RowType, WireType, XapiEncodeSink, XapiRoot,
+    XapiRootDecoder,
 };
 
 #[allow(dead_code)]
@@ -38,10 +39,16 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
                         if document.datasets.len() >= limits.max_datasets {
                             return Err(Error::from(DecodeError::Limit("max_datasets")));
                         }
+                        let id = attr(&reader, &start, b"id")?.ok_or_else(|| {
+                            Error::from(DecodeError::message("dataset id is required"))
+                        })?;
                         dataset = Some(RawDataset {
-                            id: attr(&reader, &start, b"id")?.unwrap_or_default(),
+                            id,
                             columns: Vec::new(),
+                            column_sizes: Vec::new(),
+                            column_meta: Vec::new(),
                             const_columns: Vec::new(),
+                            const_column_sizes: Vec::new(),
                             rows: Vec::new(),
                         })
                     }
@@ -53,6 +60,9 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
                         })
                     }
                     b"OrgRow" => {
+                        if row.is_none() {
+                            return Err(Error::from(DecodeError::message("OrgRow outside Row")));
+                        }
                         if let Some(current) = row.as_mut() {
                             current.original = Some(Vec::new());
                         }
@@ -80,18 +90,15 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
                             let wire = parse_wire(attr(&reader, &start, b"type")?.as_deref())?;
                             let value = if is_null(&reader, &start)? {
                                 RawValue::Null
+                            } else if attr(&reader, &start, b"value")?.is_none() {
+                                RawValue::Missing
                             } else {
                                 RawValue::Text(attr(&reader, &start, b"value")?.unwrap_or_default())
                             };
                             current.const_columns.push((id, wire, value));
                         }
                     }
-                    b"Col" => {
-                        if row.is_none() {
-                            return Err(Error::from(DecodeError::message(
-                                "column value outside row",
-                            )));
-                        }
+                    b"Col" if row.is_some() => {
                         value_target = Some((
                             attr(&reader, &start, b"id")?.unwrap_or_default(),
                             true,
@@ -99,11 +106,7 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
                         ))
                     }
                     b"Parameter" => {
-                        let explicit_value = attr(&reader, &start, b"value")?;
                         value.clear();
-                        if let Some(explicit_value) = explicit_value {
-                            value.push_str(&explicit_value);
-                        }
                         value_target = Some((
                             attr(&reader, &start, b"id")?.unwrap_or_default(),
                             false,
@@ -183,14 +186,19 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
                         ));
                     }
                 }
-                b"Parameter" => document.parameters.push((
-                    attr(&reader, &start, b"id")?.unwrap_or_default(),
-                    if is_null(&reader, &start)? {
+                b"Parameter" => {
+                    let id = attr(&reader, &start, b"id")?
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| {
+                            Error::from(DecodeError::message("parameter id is required"))
+                        })?;
+                    let raw = if is_null(&reader, &start)? {
                         RawValue::Null
                     } else {
-                        RawValue::Text(attr(&reader, &start, b"value")?.unwrap_or_default())
-                    },
-                )),
+                        RawValue::Text(String::new())
+                    };
+                    document.parameters.push((id, raw));
+                }
                 _ => {}
             },
             Ok(Event::End(end)) => {
@@ -262,7 +270,12 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
     Ok(document)
 }
 
-pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: bool) -> Result<T> {
+pub fn decode_stream<T: XapiRoot, R: Read>(
+    input: R,
+    format: Format,
+    limits: Limits,
+    strict: bool,
+) -> Result<T> {
     let mut reader = Reader::from_reader(std::io::BufReader::new(
         input.take(limits.max_document_bytes.saturating_add(1)),
     ));
@@ -275,6 +288,7 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
     let mut row = None::<RawRow>;
     let mut in_original = false;
     let mut value_target = None::<(String, bool, bool)>;
+    let mut parameter_wire = None::<crate::WireType>;
     let mut value = String::new();
     let mut depth = 0usize;
     let mut datasets = 0usize;
@@ -305,7 +319,11 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
                         if datasets > limits.max_datasets {
                             return Err(Error::from(DecodeError::Limit("max_datasets")));
                         }
-                        let id = attr(&reader, &start, b"id")?.unwrap_or_default();
+                        let id = attr(&reader, &start, b"id")?
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                Error::from(DecodeError::message("dataset id is required"))
+                            })?;
                         decoder.dataset_begin(&id)?;
                         dataset = Some(id);
                         dataset_columns.clear();
@@ -347,7 +365,9 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
                             )));
                         }
                         dataset_columns.push((id.clone(), wire));
-                        let raw = if is_null(&reader, &start)? {
+                        let raw = if is_null(&reader, &start)?
+                            || attr(&reader, &start, b"value")?.is_none()
+                        {
                             RawValue::Null
                         } else {
                             let value = attr(&reader, &start, b"value")?.unwrap_or_default();
@@ -368,17 +388,15 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
                         })
                     }
                     b"OrgRow" => {
+                        if row.is_none() {
+                            return Err(Error::from(DecodeError::message("OrgRow outside Row")));
+                        }
                         if let Some(current) = row.as_mut() {
                             current.original = Some(Vec::new());
                         }
                         in_original = true;
                     }
-                    b"Col" => {
-                        if row.is_none() {
-                            return Err(Error::from(DecodeError::message(
-                                "column value outside row",
-                            )));
-                        }
+                    b"Col" if row.is_some() => {
                         value_target = Some((
                             attr(&reader, &start, b"id")?.unwrap_or_default(),
                             true,
@@ -386,17 +404,17 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
                         ))
                     }
                     b"Parameter" => {
-                        let explicit_value = attr(&reader, &start, b"value")?;
                         value.clear();
-                        if let Some(explicit_value) = explicit_value {
-                            value.push_str(&explicit_value);
-                            enforce_scalar_limit(&value, limits)?;
-                        }
-                        value_target = Some((
-                            attr(&reader, &start, b"id")?.unwrap_or_default(),
-                            false,
-                            is_null(&reader, &start)?,
-                        ))
+                        let id = attr(&reader, &start, b"id")?
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                Error::from(DecodeError::message("parameter id is required"))
+                            })?;
+                        value_target = Some((id, false, is_null(&reader, &start)?));
+                        parameter_wire = attr(&reader, &start, b"type")?
+                            .as_deref()
+                            .map(|wire| parse_wire(Some(wire)))
+                            .transpose()?;
                     }
                     _ => {}
                 }
@@ -456,6 +474,36 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
                     decoder.unknown_root_member(id)?;
                 }
                 match start.local_name().as_ref() {
+                    b"Parameter" => {
+                        let id = attr(&reader, &start, b"id")?
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                Error::from(DecodeError::message("parameter id is required"))
+                            })?;
+                        let declared_wire = attr(&reader, &start, b"type")?;
+                        let wire = if let Some(field) = T::schema().fields.iter().find(|field| {
+                            field.kind == crate::RootFieldKind::Parameter && field.id == id
+                        }) {
+                            Some(field.wire)
+                        } else {
+                            declared_wire
+                                .as_deref()
+                                .map(|wire| parse_wire(Some(wire)))
+                                .transpose()?
+                        };
+                        let raw = if is_null(&reader, &start)? {
+                            RawValue::Null
+                        } else if matches!(format, Format::XPlatformXml4000) {
+                            let raw = attr(&reader, &start, b"value")?.unwrap_or_default();
+                            enforce_scalar_limit(&raw, limits)?;
+                            RawValue::Text(raw)
+                        } else {
+                            RawValue::Text(String::new())
+                        };
+                        let raw = optimize_for::<T>(raw, wire, limits)?;
+                        decoder.parameter(&id, &raw)?;
+                        decoder.parameter_wire(wire)?;
+                    }
                     b"Row" => {
                         let current = RawRow {
                             row_type: parse_row_type(attr(&reader, &start, b"type")?.as_deref())?,
@@ -477,7 +525,9 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
                         if datasets > limits.max_datasets {
                             return Err(Error::from(DecodeError::Limit("max_datasets")));
                         }
-                        let id = attr(&reader, &start, b"id")?.unwrap_or_default();
+                        let id = attr(&reader, &start, b"id")?.ok_or_else(|| {
+                            Error::from(DecodeError::message("dataset id is required"))
+                        })?;
                         decoder.dataset_begin(&id)?;
                         decoder.dataset_columns(&id, &[])?;
                         columns = 0;
@@ -519,6 +569,8 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
                         dataset_columns.push((id.clone(), wire));
                         let raw = if is_null(&reader, &start)? {
                             RawValue::Null
+                        } else if attr(&reader, &start, b"value")?.is_none() {
+                            RawValue::Missing
                         } else {
                             let value = attr(&reader, &start, b"value")?.unwrap_or_default();
                             enforce_scalar_limit(&value, limits)?;
@@ -552,25 +604,6 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
                             };
                             target.push((id, optimize_for::<T>(raw, wire, limits)?));
                         }
-                    }
-                    b"Parameter" => {
-                        let id = attr(&reader, &start, b"id")?.unwrap_or_default();
-                        let raw = if is_null(&reader, &start)? {
-                            RawValue::Null
-                        } else {
-                            let value = attr(&reader, &start, b"value")?.unwrap_or_default();
-                            enforce_scalar_limit(&value, limits)?;
-                            RawValue::Text(value)
-                        };
-                        let wire = T::schema()
-                            .fields
-                            .iter()
-                            .find(|field| {
-                                field.kind == crate::RootFieldKind::Parameter && field.id == id
-                            })
-                            .map(|field| field.wire);
-                        let raw = optimize_for::<T>(raw, wire, limits)?;
-                        decoder.parameter(&id, &raw)?;
                     }
                     _ => {}
                 }
@@ -614,6 +647,7 @@ pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: boo
                                 }
                             } else {
                                 decoder.parameter(&id, &raw)?;
+                                decoder.parameter_wire(parameter_wire.take())?;
                             }
                         }
                     }
@@ -863,6 +897,216 @@ pub fn encode<T: XapiRoot, W: Write>(output: W, value: &T) -> Result<()> {
     Ok(())
 }
 
+pub fn encode_raw<W: Write>(
+    output: W,
+    document: &crate::RawDocument,
+    format: Format,
+) -> Result<()> {
+    let mut writer = Writer::new_with_indent(output, b'\t', 1);
+    writer
+        .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .map_err(io_encode)?;
+    let (namespace, version) = match format {
+        Format::XPlatformXml4000 => ("http://www.tobesoft.com/platform/dataset", Some("5000")),
+        Format::NexacroXml4000 => ("http://www.nexacroplatform.com/platform/dataset", None),
+        _ => unreachable!(),
+    };
+    let mut root = BytesStart::new("Root");
+    root.push_attribute(("xmlns", namespace));
+    if let Some(version) = version {
+        root.push_attribute(("ver", version));
+    }
+    writer.write_event(Event::Start(root)).map_err(io_encode)?;
+
+    if document.parameters.is_empty() {
+        writer
+            .write_event(Event::Empty(BytesStart::new("Parameters")))
+            .map_err(io_encode)?;
+    } else {
+        writer
+            .write_event(Event::Start(BytesStart::new("Parameters")))
+            .map_err(io_encode)?;
+        for (index, (id, raw)) in document.parameters.iter().enumerate() {
+            let wire = document
+                .parameter_wires
+                .get(index)
+                .and_then(|wire| wire.as_deref())
+                .and_then(parse_wire_name)
+                .or(Some(WireType::String));
+            write_value_mode(
+                &mut writer,
+                "Parameter",
+                id,
+                raw,
+                wire,
+                format == Format::XPlatformXml4000,
+            )?;
+        }
+        writer
+            .write_event(Event::End(BytesEnd::new("Parameters")))
+            .map_err(io_encode)?;
+    }
+
+    for dataset in &document.datasets {
+        let mut dataset_start = BytesStart::new("Dataset");
+        dataset_start.push_attribute(("id", dataset.id.as_str()));
+        writer
+            .write_event(Event::Start(dataset_start))
+            .map_err(io_encode)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("ColumnInfo")))
+            .map_err(io_encode)?;
+        let write_columns = |writer: &mut Writer<W>| -> Result<()> {
+            for (id, wire) in &dataset.columns {
+                let mut column = BytesStart::new("Column");
+                column.push_attribute(("id", id.as_str()));
+                column.push_attribute(("type", wire.to_string().to_ascii_lowercase().as_str()));
+                column.push_attribute(("size", default_xml_size(*wire)));
+                if *wire == WireType::Blob {
+                    column.push_attribute(("encrypt", "base64"));
+                }
+                writer
+                    .write_event(Event::Empty(column))
+                    .map_err(io_encode)?;
+            }
+            Ok(())
+        };
+        let write_constants = |writer: &mut Writer<W>| -> Result<()> {
+            for (id, wire, raw) in &dataset.const_columns {
+                let mut column = BytesStart::new("ConstColumn");
+                column.push_attribute(("id", id.as_str()));
+                column.push_attribute(("type", wire.to_string().to_ascii_lowercase().as_str()));
+                column.push_attribute(("size", default_xml_size(*wire)));
+                if *wire == WireType::Blob {
+                    column.push_attribute(("encrypt", "base64"));
+                }
+                match raw {
+                    RawValue::Text(value) => column.push_attribute(("value", value.as_str())),
+                    RawValue::Bytes(value) => {
+                        let encoded = STANDARD.encode(value);
+                        column.push_attribute(("value", encoded.as_str()));
+                    }
+                    RawValue::Null => column.push_attribute(("null", "true")),
+                    RawValue::Missing => {}
+                }
+                if *wire == WireType::Blob {
+                    writer
+                        .write_event(Event::Start(column))
+                        .map_err(io_encode)?;
+                    writer
+                        .write_event(Event::Text(BytesText::new("")))
+                        .map_err(io_encode)?;
+                    writer
+                        .write_event(Event::End(BytesEnd::new("ConstColumn")))
+                        .map_err(io_encode)?;
+                } else {
+                    writer
+                        .write_event(Event::Empty(column))
+                        .map_err(io_encode)?;
+                }
+            }
+            Ok(())
+        };
+        if format == Format::XPlatformXml4000 {
+            write_columns(&mut writer)?;
+            write_constants(&mut writer)?;
+        } else {
+            write_constants(&mut writer)?;
+            write_columns(&mut writer)?;
+        }
+        writer
+            .write_event(Event::End(BytesEnd::new("ColumnInfo")))
+            .map_err(io_encode)?;
+        writer
+            .write_event(Event::Start(BytesStart::new("Rows")))
+            .map_err(io_encode)?;
+        for row in &dataset.rows {
+            let mut row_start = BytesStart::new("Row");
+            if row.row_type != RowType::Normal {
+                row_start.push_attribute(("type", row_type_name(row.row_type)));
+            }
+            writer
+                .write_event(Event::Start(row_start))
+                .map_err(io_encode)?;
+            for (id, raw) in &row.values {
+                write_value_mode(
+                    &mut writer,
+                    "Col",
+                    id,
+                    raw,
+                    None,
+                    format == Format::XPlatformXml4000,
+                )?;
+            }
+            if let Some(original) = &row.original {
+                writer
+                    .write_event(Event::Start(BytesStart::new("OrgRow")))
+                    .map_err(io_encode)?;
+                for (id, raw) in original {
+                    write_value_mode(
+                        &mut writer,
+                        "Col",
+                        id,
+                        raw,
+                        None,
+                        format == Format::XPlatformXml4000,
+                    )?;
+                }
+                writer
+                    .write_event(Event::End(BytesEnd::new("OrgRow")))
+                    .map_err(io_encode)?;
+            }
+            writer
+                .write_event(Event::End(BytesEnd::new("Row")))
+                .map_err(io_encode)?;
+        }
+        writer
+            .write_event(Event::End(BytesEnd::new("Rows")))
+            .map_err(io_encode)?;
+        writer
+            .write_event(Event::End(BytesEnd::new("Dataset")))
+            .map_err(io_encode)?;
+    }
+    writer
+        .write_event(Event::End(BytesEnd::new("Root")))
+        .map_err(io_encode)?;
+    writer.into_inner().write_all(b"\n").map_err(Error::from)
+}
+
+fn default_xml_size(wire: WireType) -> &'static str {
+    match wire {
+        WireType::String => "32",
+        WireType::Int => "4",
+        WireType::Long => "8",
+        WireType::Float => "4",
+        WireType::Double => "8",
+        WireType::Decimal | WireType::BigDecimal => "16",
+        WireType::Boolean => "2",
+        WireType::Date => "6",
+        WireType::Time => "9",
+        WireType::DateTime => "17",
+        WireType::Blob => "256",
+    }
+}
+
+fn parse_wire_name(value: &str) -> Option<WireType> {
+    Some(match value.to_ascii_uppercase().as_str() {
+        "STRING" => WireType::String,
+        "INT" => WireType::Int,
+        "LONG" => WireType::Long,
+        "FLOAT" => WireType::Float,
+        "DOUBLE" => WireType::Double,
+        "DECIMAL" => WireType::Decimal,
+        "BIGDECIMAL" => WireType::BigDecimal,
+        "DATE" => WireType::Date,
+        "TIME" => WireType::Time,
+        "DATETIME" => WireType::DateTime,
+        "BLOB" => WireType::Blob,
+        "BOOLEAN" => WireType::Boolean,
+        _ => return None,
+    })
+}
+
 struct XmlSink<W: Write> {
     writer: Writer<W>,
     format: Format,
@@ -904,7 +1148,11 @@ impl<W: Write> XapiEncodeSink for XmlSink<W> {
             Format::NexacroXml4000 => {
                 ("http://www.nexacroplatform.com/platform/dataset", "version")
             }
-            Format::NexacroJson10 => unreachable!(),
+            Format::NexacroJson10
+            | Format::XPlatformSsv
+            | Format::NexacroSsv
+            | Format::NexacroBinary5000
+            | Format::XPlatformBinary5000 => unreachable!(),
         };
         let mut root = BytesStart::new("Root");
         root.push_attribute(("xmlns", namespace));
@@ -1045,13 +1293,23 @@ fn write_value<W: Write>(
     raw: &RawValue,
     wire: Option<crate::WireType>,
 ) -> Result<()> {
+    write_value_mode(writer, tag, id, raw, wire, true)
+}
+fn write_value_mode<W: Write>(
+    writer: &mut Writer<W>,
+    tag: &str,
+    id: &str,
+    raw: &RawValue,
+    wire: Option<crate::WireType>,
+    escape_controls: bool,
+) -> Result<()> {
     if matches!(raw, RawValue::Missing) {
         return Ok(());
     }
     let mut start = BytesStart::new(tag);
     start.push_attribute(("id", id));
     if let Some(wire) = wire {
-        let wire = wire.to_string();
+        let wire = wire.to_string().to_ascii_lowercase();
         start.push_attribute(("type", wire.as_str()));
     }
     if matches!(raw, RawValue::Null) {
@@ -1059,7 +1317,7 @@ fn write_value<W: Write>(
     }
     writer.write_event(Event::Start(start)).map_err(io_encode)?;
     match raw {
-        RawValue::Text(value) => write_text(writer, value)?,
+        RawValue::Text(value) => write_text(writer, value, escape_controls)?,
         RawValue::Bytes(value) => write_base64(writer, value)?,
         RawValue::Missing | RawValue::Null => {}
     }
@@ -1100,12 +1358,14 @@ fn write_base64<W: Write>(writer: &mut Writer<W>, value: &[u8]) -> Result<()> {
         .map_err(io_encode)
 }
 
-fn write_text<W: Write>(writer: &mut Writer<W>, value: &str) -> Result<()> {
+fn write_text<W: Write>(writer: &mut Writer<W>, value: &str, escape_controls: bool) -> Result<()> {
     let mut normal = String::new();
     for character in value.chars() {
         match character {
             '\0' => return Err(EncodeError::InvalidScalar("NUL is not valid in XML".into()).into()),
-            '\u{1}'..='\u{8}' | '\u{B}'..='\u{C}' | '\u{E}'..='\u{1F}' => {
+            '\t' | '\r' | '\n' | '\u{1}'..='\u{8}' | '\u{B}'..='\u{C}' | '\u{E}'..='\u{1F}'
+                if escape_controls =>
+            {
                 if !normal.is_empty() {
                     writer
                         .write_event(Event::Text(BytesText::new(&normal)))

@@ -5,10 +5,13 @@
 
 extern crate self as xapi;
 
+mod binary;
 mod error;
 mod json;
 mod scalar;
+mod ssv;
 mod xml;
+pub mod zlib;
 
 pub mod dynamic;
 
@@ -35,7 +38,10 @@ pub enum RawValue {
 pub struct RawDataset {
     pub id: String,
     pub columns: Vec<(String, WireType)>,
+    pub column_sizes: Vec<Option<String>>,
+    pub column_meta: Vec<(Option<String>, Option<String>)>,
     pub const_columns: Vec<(String, WireType, RawValue)>,
+    pub const_column_sizes: Vec<Option<String>>,
     pub rows: Vec<RawRow>,
 }
 
@@ -49,6 +55,7 @@ pub struct RawRow {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RawDocument {
     pub parameters: Vec<(String, RawValue)>,
+    pub parameter_wires: Vec<Option<String>>,
     pub datasets: Vec<RawDataset>,
 }
 
@@ -122,6 +129,10 @@ pub enum Format {
     XPlatformXml4000,
     NexacroXml4000,
     NexacroJson10,
+    XPlatformSsv,
+    NexacroSsv,
+    NexacroBinary5000,
+    XPlatformBinary5000,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +295,10 @@ pub trait XapiRootDecoder<T>: Sized {
         Ok(())
     }
     fn parameter(&mut self, id: &str, value: &RawValue) -> Result<()>;
+    fn parameter_wire(&mut self, wire: Option<WireType>) -> Result<()> {
+        let _ = wire;
+        Ok(())
+    }
     fn dataset_begin(&mut self, dataset: &str) -> Result<()> {
         let _ = dataset;
         Ok(())
@@ -363,9 +378,16 @@ where
 {
     match format {
         Format::XPlatformXml4000 | Format::NexacroXml4000 => {
-            xml::decode_stream(reader, limits, strict)
+            xml::decode_stream(reader, format, limits, strict)
         }
         Format::NexacroJson10 => json::decode_stream(reader, limits, strict),
+        Format::NexacroBinary5000 | Format::XPlatformBinary5000 => {
+            T::decode_raw(binary::decode_raw(reader, limits, strict)?)
+        }
+        Format::XPlatformSsv | Format::NexacroSsv => {
+            let document = ssv::decode_raw(reader, format, limits, strict)?;
+            T::decode_raw(document)
+        }
     }
 }
 
@@ -415,6 +437,13 @@ where
             xml::encode_stream(writer, value, format)
         }
         Format::NexacroJson10 => json::encode_stream(writer, value),
+        Format::NexacroBinary5000 | Format::XPlatformBinary5000 => {
+            binary::encode(writer, &value.encode_raw()?)
+        }
+        Format::XPlatformSsv | Format::NexacroSsv => {
+            let document = value.encode_raw()?;
+            ssv::encode(writer, &document, format)
+        }
     }
 }
 

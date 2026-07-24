@@ -113,10 +113,10 @@ impl<'de, T: XapiRoot> Visitor<'de> for RootVisitor<'_, T> {
     ) -> std::result::Result<Self::Value, A::Error> {
         let mut seen = HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
-            let normalized = key.to_ascii_lowercase();
-            if !seen.insert(normalized.clone()) {
+            if !seen.insert(key.to_ascii_lowercase()) {
                 return Err(de::Error::custom("duplicate JSON object key"));
             }
+            let normalized = key.to_ascii_lowercase();
             match normalized.as_str() {
                 "version" => {
                     let version = map.next_value::<String>()?;
@@ -244,9 +244,10 @@ impl<'de, T: XapiRoot> Visitor<'de> for ParameterItemVisitor<'_, T> {
             }
         }
         let id = id.ok_or_else(|| de::Error::custom("parameter id is required"))?;
-        let raw = value.ok_or_else(|| de::Error::custom("parameter value is required"))?;
-        let value = raw_scalar(&raw, self.limits).map_err(de::Error::custom)?;
-        drop(raw);
+        let value = value
+            .map(|raw| raw_scalar(&raw, self.limits).map_err(de::Error::custom))
+            .transpose()?
+            .unwrap_or(XValue::Missing);
         let value = optimize_for::<T>(value, parameter_wire::<T>(&id), self.limits)
             .map_err(de::Error::custom)?;
         self.decoder
@@ -767,8 +768,13 @@ impl<'de, T: XapiRoot> Visitor<'de> for RowsDispatchVisitor<'_, T> {
             .map_err(de::Error::custom)?;
             if row.row_type == RowType::Original {
                 let Some(current) = self.pending.as_mut() else {
-                    return Err(de::Error::custom("original row has no preceding row"));
+                    return Err(de::Error::custom(
+                        "original row must follow a materialized row",
+                    ));
                 };
+                if current.original.is_some() {
+                    return Err(de::Error::custom("row has duplicate original values"));
+                }
                 current.original = Some(row.values);
             } else {
                 if let Some(current) = self.pending.take() {
@@ -825,8 +831,13 @@ impl<'de> Visitor<'de> for RowsVisitor {
         })? {
             if row.row_type == RowType::Original {
                 let Some(current) = self.pending.as_mut() else {
-                    return Err(de::Error::custom("original row has no preceding row"));
+                    return Err(de::Error::custom(
+                        "original row must follow a materialized row",
+                    ));
                 };
+                if current.original.is_some() {
+                    return Err(de::Error::custom("row has duplicate original values"));
+                }
                 current.original = Some(row.values);
             } else {
                 if let Some(current) = self.pending.take() {
@@ -1066,10 +1077,51 @@ fn parameters(raw: &RawValue) -> Result<Vec<(String, XValue)>> {
                 .ok_or_else(|| Error::from(DecodeError::message("parameter id is required")))?;
             let value = find(&object, "value")
                 .or_else(|| find(&object, "val"))
-                .ok_or_else(|| Error::from(DecodeError::message("parameter value is required")))?;
-            Ok((id, scalar(value.get())?))
+                .map(|value| scalar(value.get()))
+                .transpose()?
+                .unwrap_or(XValue::Null);
+            Ok((id, value))
         })
         .collect()
+}
+
+type ColumnInfo = (Vec<(String, WireType)>, Vec<(String, WireType, XValue)>);
+fn column_info(raw: &RawValue, limits: crate::Limits) -> Result<ColumnInfo> {
+    if raw.get().trim_start().starts_with('[') {
+        return Ok((columns(raw, limits)?, Vec::new()));
+    }
+    let object: BTreeMap<String, Box<RawValue>> =
+        serde_json::from_str(raw.get()).map_err(json_error)?;
+    let columns = find(&object, "Column")
+        .or_else(|| find(&object, "columns"))
+        .map(|raw| columns(raw, limits))
+        .transpose()?
+        .unwrap_or_default();
+    let constants = find(&object, "ConstColumn")
+        .or_else(|| find(&object, "constColumns"))
+        .map(|raw| {
+            let items: Vec<Box<RawValue>> = serde_json::from_str(raw.get()).map_err(json_error)?;
+            items
+                .into_iter()
+                .map(|item| {
+                    let object: BTreeMap<String, Box<RawValue>> =
+                        serde_json::from_str(item.get()).map_err(json_error)?;
+                    let id = string_field(&object, "id")?.ok_or_else(|| {
+                        Error::from(DecodeError::message("constant column id is required"))
+                    })?;
+                    let wire = parse_wire(string_field(&object, "type")?.as_deref())?;
+                    let value = find(&object, "value")
+                        .or_else(|| find(&object, "val"))
+                        .map(|value| scalar(value.get()))
+                        .transpose()?
+                        .unwrap_or(XValue::Missing);
+                    Ok::<(String, WireType, XValue), Error>((id, wire, value))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok((columns, constants))
 }
 
 fn datasets(raw: &RawValue, limits: crate::Limits) -> Result<Vec<RawDataset>> {
@@ -1081,10 +1133,11 @@ fn datasets(raw: &RawValue, limits: crate::Limits) -> Result<Vec<RawDataset>> {
                 serde_json::from_str(item.get()).map_err(json_error)?;
             let id = string_field(&object, "id")?
                 .ok_or_else(|| Error::from(DecodeError::message("dataset id is required")))?;
-            let columns = match find(&object, "ColumnInfo").or_else(|| find(&object, "columns")) {
-                Some(raw_columns) => columns(raw_columns, limits)?,
-                None => Vec::new(),
-            };
+            let (columns, const_columns) =
+                match find(&object, "ColumnInfo").or_else(|| find(&object, "columns")) {
+                    Some(raw_columns) => column_info(raw_columns, limits)?,
+                    None => (Vec::new(), Vec::new()),
+                };
             let rows = match find(&object, "Rows").or_else(|| find(&object, "rows")) {
                 Some(raw_rows) => rows(raw_rows)?,
                 None => Vec::new(),
@@ -1092,7 +1145,10 @@ fn datasets(raw: &RawValue, limits: crate::Limits) -> Result<Vec<RawDataset>> {
             Ok(RawDataset {
                 id,
                 columns,
-                const_columns: Vec::new(),
+                column_sizes: Vec::new(),
+                column_meta: Vec::new(),
+                const_columns,
+                const_column_sizes: Vec::new(),
                 rows,
             })
         })
@@ -1120,8 +1176,8 @@ fn columns(raw: &RawValue, limits: crate::Limits) -> Result<Vec<(String, WireTyp
 fn parse_wire(value: Option<&str>) -> Result<WireType> {
     match value.unwrap_or("STRING").to_ascii_uppercase().as_str() {
         "STRING" => Ok(WireType::String),
-        "INT" => Ok(WireType::Int),
-        "LONG" => Ok(WireType::Long),
+        "SHORT" | "USHORT" | "INT" | "UINT" => Ok(WireType::Int),
+        "LONG" | "ULONG" => Ok(WireType::Long),
         "FLOAT" => Ok(WireType::Float),
         "DOUBLE" => Ok(WireType::Double),
         "DECIMAL" => Ok(WireType::Decimal),
@@ -1129,56 +1185,97 @@ fn parse_wire(value: Option<&str>) -> Result<WireType> {
         "DATE" => Ok(WireType::Date),
         "TIME" => Ok(WireType::Time),
         "DATETIME" => Ok(WireType::DateTime),
-        "BLOB" => Ok(WireType::Blob),
+        "BLOB" | "FILE" => Ok(WireType::Blob),
         "BOOLEAN" | "BOOL" => Ok(WireType::Boolean),
-        _ => Err(Error::from(DecodeError::message(
-            "unsupported JSON wire type",
-        ))),
+        _ => Ok(WireType::String),
     }
 }
 
 fn rows(raw: &RawValue) -> Result<Vec<RawRow>> {
     let items: Vec<Box<RawValue>> = serde_json::from_str(raw.get()).map_err(json_error)?;
-    items
-        .into_iter()
-        .map(|item| {
-            let object: BTreeMap<String, Box<RawValue>> =
-                serde_json::from_str(item.get()).map_err(json_error)?;
-            let (row_type, values, original) = if let Some((kind, raw)) = [
-                ("I", RowType::Insert),
-                ("U", RowType::Update),
-                ("D", RowType::Delete),
-            ]
-            .iter()
-            .find_map(|(key, kind)| find(&object, key).map(|raw| (*kind, raw)))
-            {
-                (
-                    kind,
-                    object_values(raw)?,
-                    find(&object, "O").map(object_values).transpose()?,
-                )
-            } else {
-                (
-                    RowType::Normal,
-                    object
-                        .into_iter()
-                        .map(|(id, value)| Ok((id, scalar(value.get())?)))
-                        .collect::<Result<Vec<_>>>()?,
-                    None,
-                )
-            };
-            Ok(RawRow {
-                row_type,
-                values,
-                original,
-            })
-        })
-        .collect()
+    let mut rows: Vec<RawRow> = Vec::with_capacity(items.len());
+    for item in items {
+        let object: BTreeMap<String, Box<RawValue>> =
+            serde_json::from_str(item.get()).map_err(json_error)?;
+        let marker = string_field(&object, "_RowType_")?;
+        match marker.as_deref() {
+            Some("O") => {
+                let original = object_values_without(object, "_RowType_")?;
+                let Some(previous) = rows.last_mut() else {
+                    return Err(Error::from(DecodeError::message(
+                        "original row must follow a materialized row",
+                    )));
+                };
+                if previous.original.replace(original).is_some() {
+                    return Err(Error::from(DecodeError::message(
+                        "row has duplicate original values",
+                    )));
+                }
+            }
+            Some("I") | Some("U") | Some("D") | Some("N") => {
+                let row_type = match marker.as_deref().unwrap_or("N") {
+                    "I" => RowType::Insert,
+                    "U" => RowType::Update,
+                    "D" => RowType::Delete,
+                    _ => RowType::Normal,
+                };
+                rows.push(RawRow {
+                    row_type,
+                    values: object_values_without(object, "_RowType_")?,
+                    original: None,
+                });
+            }
+            Some(other) => {
+                return Err(Error::from(DecodeError::message(format!(
+                    "unsupported JSON row type: {other}",
+                ))));
+            }
+            None => {
+                let (row_type, values, original) = if let Some((kind, raw)) = [
+                    ("I", RowType::Insert),
+                    ("U", RowType::Update),
+                    ("D", RowType::Delete),
+                ]
+                .iter()
+                .find_map(|(key, kind)| find(&object, key).map(|raw| (*kind, raw)))
+                {
+                    (
+                        kind,
+                        object_values(raw)?,
+                        find(&object, "O").map(object_values).transpose()?,
+                    )
+                } else {
+                    (RowType::Normal, object_values_map(object)?, None)
+                };
+                rows.push(RawRow {
+                    row_type,
+                    values,
+                    original,
+                });
+            }
+        }
+    }
+    Ok(rows)
 }
-
 fn object_values(raw: &RawValue) -> Result<Vec<(String, XValue)>> {
     let object: BTreeMap<String, Box<RawValue>> =
         serde_json::from_str(raw.get()).map_err(json_error)?;
+    object_values_map(object)
+}
+
+fn object_values_without(
+    object: BTreeMap<String, Box<RawValue>>,
+    excluded: &str,
+) -> Result<Vec<(String, XValue)>> {
+    object_values_map(
+        object
+            .into_iter()
+            .filter(|(id, _)| !id.eq_ignore_ascii_case(excluded))
+            .collect(),
+    )
+}
+
+fn object_values_map(object: BTreeMap<String, Box<RawValue>>) -> Result<Vec<(String, XValue)>> {
     object
         .into_iter()
         .map(|(id, value)| Ok((id, scalar(value.get())?)))
@@ -1327,6 +1424,354 @@ pub fn encode<T: XapiRoot, W: Write>(output: W, value: &T) -> Result<()> {
 pub fn encode_stream<T: XapiRoot, W: Write>(output: W, value: &T) -> Result<()> {
     let mut sink = JsonSink::new(output);
     value.encode_stream(&mut sink)
+}
+
+/// Encodes a runtime-schema document using the public Nexacro JSON shape.
+pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Result<()> {
+    use serde_json::{Map, Value};
+    let mut root = Map::new();
+    if !document.parameters.is_empty() {
+        root.insert(
+            "Parameters".into(),
+            Value::Array(
+                document
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (id, raw))| {
+                        let mut item = Map::new();
+                        item.insert("id".into(), Value::String(id.clone()));
+                        let wire_name = document
+                            .parameter_wires
+                            .get(index)
+                            .and_then(|wire| wire.as_deref());
+                        let wire = wire_name.and_then(|wire| parse_wire(Some(wire)).ok());
+                        item.insert(
+                            "type".into(),
+                            Value::String(
+                                wire.map(json_wire_name).unwrap_or_else(|| "string".into()),
+                            ),
+                        );
+                        let value = match (wire_name, raw) {
+                            (Some("UINT" | "USHORT"), XValue::Text(value))
+                                if value.parse::<i32>().is_err() =>
+                            {
+                                XValue::Text("0".into())
+                            }
+                            (Some("ULONG" | "LONG"), XValue::Text(value))
+                                if value.parse::<i64>().is_err() =>
+                            {
+                                XValue::Text("0".into())
+                            }
+                            _ => raw.clone(),
+                        };
+                        item.insert("value".into(), raw_json(&value, wire));
+                        Value::Object(item)
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    let parameters = root.remove("Parameters");
+    if !document.datasets.is_empty() {
+        root.insert(
+            "Datasets".into(),
+            Value::Array(
+                document
+                    .datasets
+                    .iter()
+                    .map(|dataset| {
+                        let mut item = Map::new();
+                        let mut info = Map::new();
+                        let columns: Vec<Value> = dataset
+                            .columns
+                            .iter()
+                            .map(|(id, wire)| {
+                                let mut column = Map::new();
+                                let size = json_default_size(*wire).to_owned();
+                                column.insert("size".into(), Value::String(size));
+                                column.insert("id".into(), Value::String(id.clone()));
+                                column.insert("type".into(), Value::String(json_wire_name(*wire)));
+                                Value::Object(column)
+                            })
+                            .collect();
+                        let const_columns: Vec<Value> = dataset
+                            .const_columns
+                            .iter()
+                            .map(|(id, wire, raw)| {
+                                let mut column = Map::new();
+                                let size = json_default_size(*wire).to_owned();
+                                column.insert("size".into(), Value::String(size));
+                                column.insert("id".into(), Value::String(id.clone()));
+                                column.insert("type".into(), Value::String(json_wire_name(*wire)));
+                                column.insert("value".into(), raw_json(raw, Some(*wire)));
+                                Value::Object(column)
+                            })
+                            .collect();
+                        if !const_columns.is_empty() {
+                            info.insert("ConstColumn".into(), Value::Array(const_columns));
+                        }
+                        if !columns.is_empty() {
+                            info.insert("Column".into(), Value::Array(columns));
+                        }
+                        if !info.is_empty() {
+                            item.insert("ColumnInfo".into(), Value::Object(info));
+                        }
+                        item.insert("id".into(), Value::String(dataset.id.clone()));
+                        if !dataset.rows.is_empty() {
+                            item.insert(
+                                "Rows".into(),
+                                Value::Array(
+                                    dataset
+                                        .rows
+                                        .iter()
+                                        .map(|row| {
+                                            let mut values = Map::new();
+                                            for (id, raw) in &row.values {
+                                                let wire = dataset
+                                                    .columns
+                                                    .iter()
+                                                    .find(|(name, _)| name == id)
+                                                    .map(|(_, wire)| *wire);
+                                                if matches!(raw, XValue::Missing) {
+                                                    if wire == Some(WireType::Boolean) {
+                                                        values.insert(
+                                                            id.clone(),
+                                                            Value::String("0".into()),
+                                                        );
+                                                    }
+                                                } else if !matches!(raw, XValue::Null)
+                                                    && !matches!(
+                                                        raw,
+                                                        XValue::Text(value) if value.is_empty()
+                                                    )
+                                                {
+                                                    values.insert(id.clone(), raw_json(raw, wire));
+                                                }
+                                            }
+                                            for (id, wire) in &dataset.columns {
+                                                if *wire == WireType::Boolean
+                                                    && !values.contains_key(id)
+                                                {
+                                                    values.insert(
+                                                        id.clone(),
+                                                        Value::String("0".into()),
+                                                    );
+                                                }
+                                            }
+                                            let mut result = values;
+                                            result.insert(
+                                                "_RowType_".into(),
+                                                Value::String(row_name(row.row_type).into()),
+                                            );
+                                            let mut entries =
+                                                result.into_iter().collect::<Vec<_>>();
+                                            entries.sort_by_key(|(id, _)| {
+                                                (
+                                                    java_json_bucket(id),
+                                                    dataset
+                                                        .columns
+                                                        .iter()
+                                                        .position(|(column, _)| column == id)
+                                                        .unwrap_or(usize::MAX),
+                                                )
+                                            });
+                                            let result = entries.into_iter().collect::<Map<_, _>>();
+                                            Value::Object(result)
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        Value::Object(item)
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(parameters) = parameters {
+        root.insert("Parameters".into(), parameters);
+    }
+    root.insert("version".into(), Value::String("1.0".into()));
+    let encoded = serde_json::to_vec(&Value::Object(root))
+        .map_err(|error| Error::from(EncodeError::Message(error.to_string())))?;
+    let encoded = String::from_utf8(encoded)
+        .map_err(|error| Error::from(EncodeError::Message(error.to_string())))?
+        .replace("\\\\/", "\\/");
+    output.write_all(encoded.as_bytes()).map_err(Error::from)
+}
+
+fn row_name(_row: RowType) -> &'static str {
+    "N"
+}
+fn java_json_bucket(value: &str) -> u32 {
+    let hash = value.bytes().fold(0u32, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as u32)
+    });
+    (hash ^ (hash >> 16)) & 15
+}
+fn raw_json(raw: &XValue, wire: Option<WireType>) -> serde_json::Value {
+    match raw {
+        XValue::Missing => serde_json::Value::Null,
+        XValue::Null => match wire {
+            Some(WireType::Int | WireType::Long | WireType::Boolean) => {
+                serde_json::Value::String("0".into())
+            }
+            Some(WireType::Float | WireType::Double) => serde_json::Value::String("0.0".into()),
+            Some(WireType::Decimal | WireType::BigDecimal) => serde_json::Value::String("0".into()),
+            _ => serde_json::Value::Null,
+        },
+        XValue::Text(value) if matches!(wire, Some(WireType::Int | WireType::Long)) => {
+            serde_json::Value::String(normalize_integer(value))
+        }
+        XValue::Text(value) if matches!(wire, Some(WireType::Float | WireType::Double)) => {
+            serde_json::Value::String(normalize_float_text(value))
+        }
+        XValue::Text(value) if matches!(wire, Some(WireType::Decimal | WireType::BigDecimal)) => {
+            serde_json::Value::String(normalize_decimal(value))
+        }
+        XValue::Text(value) if matches!(wire, Some(WireType::Boolean)) => {
+            serde_json::Value::String(if source_boolean(value) { "1" } else { "0" }.into())
+        }
+        XValue::Text(value) if matches!(wire, Some(WireType::Blob)) => {
+            serde_json::Value::String(value.replace('/', "\\/"))
+        }
+        XValue::Text(value) => serde_json::Value::String(value.clone()),
+        XValue::Bytes(value) => serde_json::Value::String(
+            base64::engine::general_purpose::STANDARD
+                .encode(value)
+                .replace('/', "\\/"),
+        ),
+    }
+}
+
+fn json_default_size(wire: WireType) -> &'static str {
+    match wire {
+        WireType::String => "32",
+        WireType::Int => "4",
+        WireType::Long => "8",
+        WireType::Float => "4",
+        WireType::Double => "8",
+        WireType::Decimal | WireType::BigDecimal => "16",
+        WireType::Boolean => "2",
+        WireType::Date => "6",
+        WireType::Time => "9",
+        WireType::DateTime => "17",
+        WireType::Blob => "256",
+    }
+}
+
+fn json_wire_name(wire: WireType) -> String {
+    match wire {
+        WireType::Boolean => "int",
+        WireType::Long | WireType::Decimal | WireType::BigDecimal => "bigdecimal",
+        WireType::Double => "float",
+        WireType::Blob => "blob",
+        _ => return wire.to_string().to_ascii_lowercase(),
+    }
+    .into()
+}
+fn json_number(value: &str) -> serde_json::Value {
+    serde_json::from_str(value).unwrap_or(serde_json::Value::Null)
+}
+fn source_boolean(value: &str) -> bool {
+    matches!(
+        value,
+        "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "y" | "Y" | "on" | "On" | "ON" | "1"
+    )
+}
+
+fn normalize_float_text(value: &str) -> String {
+    let value = value.trim().replace(',', "");
+    if matches!(
+        value.as_str(),
+        "NaN" | "Infinity" | "+Infinity" | "-Infinity"
+    ) {
+        return value;
+    }
+    let parsed = value.parse::<f64>().unwrap_or(0.0);
+    let mut text = parsed.to_string();
+    if !text.contains('.') && !text.contains('e') && !text.contains('E') {
+        text.push_str(".0");
+    }
+    text
+}
+fn normalize_integer(value: &str) -> String {
+    let value = value.trim().replace(',', "");
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        return i64::from_str_radix(hex, 16).unwrap_or(0).to_string();
+    }
+    value
+        .parse::<f64>()
+        .map(|v| (v.trunc() as i64).to_string())
+        .unwrap_or_else(|_| "0".into())
+}
+fn normalize_float_json(value: &str) -> serde_json::Value {
+    let value = value.trim().replace(',', "");
+    if matches!(
+        value.as_str(),
+        "NaN" | "Infinity" | "+Infinity" | "-Infinity"
+    ) {
+        return serde_json::Value::Null;
+    }
+    let parsed = value.parse::<f64>().unwrap_or(0.0);
+    let mut text = parsed.to_string();
+    if !text.contains('.') && !text.contains('e') && !text.contains('E') {
+        text.push_str(".0");
+    }
+    json_number(&text)
+}
+fn normalize_decimal(value: &str) -> String {
+    let mut value = value.trim().replace(',', "");
+    let (sign, body) = if let Some(rest) = value.strip_prefix('+') {
+        ("", rest)
+    } else if let Some(rest) = value.strip_prefix('-') {
+        ("-", rest)
+    } else {
+        ("", value.as_str())
+    };
+    value = body.to_owned();
+    let (mantissa, exponent) = value
+        .split_once(['e', 'E'])
+        .map_or((value.as_str(), ""), |(m, e)| (m, e));
+    let (integer, fraction) = mantissa
+        .split_once('.')
+        .map_or((mantissa, None), |(i, f)| (i, Some(f)));
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    match fraction {
+        Some(f) => format!("{sign}{integer}.{f}{exponent}"),
+        None => format!("{sign}{integer}{exponent}"),
+    }
+}
+fn restore_decimal_lexicals(encoded: &mut Vec<u8>, document: &crate::RawDocument) {
+    let mut from = 0;
+    for (index, (_, raw)) in document.parameters.iter().enumerate() {
+        if document
+            .parameter_wires
+            .get(index)
+            .and_then(|wire| wire.as_deref())
+            .is_some_and(|wire| wire.eq_ignore_ascii_case("BIGDECIMAL"))
+        {
+            if let XValue::Text(value) = raw {
+                let normalized = normalize_decimal(value);
+                let numeric = json_number(&normalized).to_string();
+                let needle = format!("\"value\":{numeric}").into_bytes();
+                let replacement = format!("\"value\":{normalized}").into_bytes();
+                if let Some(position) = encoded[from..]
+                    .windows(needle.len())
+                    .position(|window| window == needle)
+                {
+                    let position = from + position;
+                    encoded.splice(position..position + needle.len(), replacement);
+                    from = position;
+                }
+            }
+        }
+    }
 }
 
 struct JsonSink<W: Write> {

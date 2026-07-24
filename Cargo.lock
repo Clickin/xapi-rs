@@ -144,6 +144,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -344,7 +345,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "xapi-derive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -353,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "xapi-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "http",
@@ -367,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "xplatform-dataset"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "quick-xml",

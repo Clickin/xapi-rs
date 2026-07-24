@@ -8,10 +8,10 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Clickin/xapi-rs"
 readme = "README.md"
-version = "0.1.0"
+version = "0.2.0"
 
 [workspace.dependencies]
-xapi = { package = "xplatform-dataset", path = "crates/xapi", version = "0.1.0" }
-xapi-derive = { path = "crates/xapi-derive", version = "0.1.0" }
-xapi-http = { path = "crates/xapi-http", version = "0.1.0" }
+xapi = { package = "xplatform-dataset", path = "crates/xapi", version = "0.2.0" }
+xapi-derive = { path = "crates/xapi-derive", version = "0.2.0" }
+xapi-http = { path = "crates/xapi-http", version = "0.2.0" }
 http = "1"
