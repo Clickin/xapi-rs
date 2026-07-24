@@ -34,7 +34,8 @@ jobs:
 
       - name: Publish xapi-derive
         run: |
-          if cargo info xapi-derive@0.2.0 >/dev/null 2>&1; then
+          if curl --fail --silent --show-error \
+            https://crates.io/api/v1/crates/xapi-derive/0.2.0 >/dev/null; then
             echo "xapi-derive@0.2.0 is already published"
           else
             cargo publish -p xapi-derive --locked --token "$CARGO_REGISTRY_TOKEN"

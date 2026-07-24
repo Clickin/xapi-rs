@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-xapi = { path = "../crates/xapi" }
+xapi = { package = "xplatform-dataset", path = "../crates/xapi" }
 
 [[bin]]
 name = "codecs"
