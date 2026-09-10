@@ -11,6 +11,7 @@ mod json;
 mod scalar;
 mod ssv;
 mod xml;
+#[cfg(feature = "zlib")]
 pub mod zlib;
 
 pub mod dynamic;

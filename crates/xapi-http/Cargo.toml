@@ -18,6 +18,11 @@ xapi.workspace = true
 [features]
 default = []
 tokio = ["dep:tokio", "dep:tokio-util"]
+zlib = ["xapi/zlib"]
+
+[[bin]]
+name = "xapi-conformance"
+required-features = ["zlib"]
 
 [dependencies.tokio]
 version = "1"

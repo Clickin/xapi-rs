@@ -345,7 +345,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "xapi-derive"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "xapi-http"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64",
  "http",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "xplatform-dataset"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64",
  "quick-xml",

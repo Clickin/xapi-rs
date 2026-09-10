@@ -8,7 +8,8 @@ row-streaming XML codec, a lexical JSON codec, and an optional `xapi-http`
 integration crate for the common
 Parameters/Datasets/Rows shape. Enable its optional `tokio` feature for a
 backpressure-preserving async-to-sync streaming bridge with cancellation and
-timeout support. Profile-specific compatibility remains
+timeout support. Enable the `zlib` feature when PlatformZlib FFI support is
+needed. Profile-specific compatibility remains
 documented in `docs/protocol-compatibility.md`.
 
 Use `Vec<Tracked<Row>>` when a dataset carries RowType or an original row;
