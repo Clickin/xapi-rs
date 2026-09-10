@@ -1486,9 +1486,14 @@ pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Res
                         let columns: Vec<Value> = dataset
                             .columns
                             .iter()
-                            .map(|(id, wire)| {
+                            .enumerate()
+                            .map(|(index, (id, wire))| {
                                 let mut column = Map::new();
-                                let size = json_default_size(*wire).to_owned();
+                                let size = dataset
+                                    .column_sizes
+                                    .get(index)
+                                    .and_then(|size| size.clone())
+                                    .unwrap_or_else(|| json_default_size(*wire).to_owned());
                                 column.insert("size".into(), Value::String(size));
                                 column.insert("id".into(), Value::String(id.clone()));
                                 column.insert("type".into(), Value::String(json_wire_name(*wire)));
@@ -1498,9 +1503,14 @@ pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Res
                         let const_columns: Vec<Value> = dataset
                             .const_columns
                             .iter()
-                            .map(|(id, wire, raw)| {
+                            .enumerate()
+                            .map(|(index, (id, wire, raw))| {
                                 let mut column = Map::new();
-                                let size = json_default_size(*wire).to_owned();
+                                let size = dataset
+                                    .const_column_sizes
+                                    .get(index)
+                                    .and_then(|size| size.clone())
+                                    .unwrap_or_else(|| json_default_size(*wire).to_owned());
                                 column.insert("size".into(), Value::String(size));
                                 column.insert("id".into(), Value::String(id.clone()));
                                 column.insert("type".into(), Value::String(json_wire_name(*wire)));
@@ -1540,11 +1550,12 @@ pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Res
                                                             Value::String("0".into()),
                                                         );
                                                     }
+                                                } else if matches!(raw, XValue::Text(value) if value.is_empty())
+                                                    && wire == Some(WireType::String)
+                                                {
+                                                    values.insert(id.clone(), Value::String(String::new()));
                                                 } else if !matches!(raw, XValue::Null)
-                                                    && !matches!(
-                                                        raw,
-                                                        XValue::Text(value) if value.is_empty()
-                                                    )
+                                                    && !matches!(raw, XValue::Text(value) if value.is_empty())
                                                 {
                                                     values.insert(id.clone(), raw_json(raw, wire));
                                                 }
@@ -1576,8 +1587,7 @@ pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Res
                                                         .unwrap_or(usize::MAX),
                                                 )
                                             });
-                                            let result = entries.into_iter().collect::<Map<_, _>>();
-                                            Value::Object(result)
+                                            Value::Object(entries.into_iter().collect::<Map<_, _>>())
                                         })
                                         .collect(),
                                 ),
@@ -1601,8 +1611,11 @@ pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Res
     output.write_all(encoded.as_bytes()).map_err(Error::from)
 }
 
-fn row_name(_row: RowType) -> &'static str {
-    "N"
+fn row_name(row: RowType) -> &'static str {
+    match row {
+        RowType::Normal => "N",
+        RowType::Insert | RowType::Update | RowType::Delete | RowType::Original => "N",
+    }
 }
 fn java_json_bucket(value: &str) -> u32 {
     let hash = value.bytes().fold(0u32, |hash, byte| {

@@ -90,19 +90,10 @@ fn handle(line: &str) -> Value {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let limits = Limits::default();
-    if matches!(format, Format::NexacroSsv | Format::XPlatformSsv)
-        && (options.get("ssvUnitSeparator").is_some()
-            || options.get("ssvRecordSeparator").is_some())
-    {
-        return error_response(
-            "malformed-input",
-            "",
-            "custom SSV separators are unsupported".into(),
-        );
-    }
     match operation {
         "decode" => match input_bytes(&request) {
             Ok(bytes) => {
+
                 if bytes.len() as u64 > limits.max_document_bytes {
                     return error_response(
                         "limit-exceeded",
@@ -430,32 +421,8 @@ fn add_ssv_options(metadata: &mut Metadata, options: &Value) {
 }
 
 fn normalize_ssv(bytes: &[u8], options: &Value, format: Format) -> Vec<u8> {
-    if !matches!(format, Format::XPlatformSsv | Format::NexacroSsv) {
-        return bytes.to_vec();
-    }
-    let unit = options
-        .get("ssvUnitSeparator")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("\x1f")
-        .as_bytes();
-    let record = options
-        .get("ssvRecordSeparator")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("\x1e")
-        .as_bytes();
-    if unit == b"\x1f" && record == b"\x1e" {
-        return bytes.to_vec();
-    }
-    let mut out = bytes.to_vec();
-    if record != b"\x1e" {
-        out = replace_bytes(&out, record, b"\x1e");
-    }
-    if unit != b"\x1f" {
-        out = replace_bytes(&out, unit, b"\x1f");
-    }
-    out
+    let _ = (options, format);
+    bytes.to_vec()
 }
 
 fn decode_payload(
@@ -914,6 +881,17 @@ fn validate_encode(value: &Value, limits: Limits) -> Result<(), Value> {
                 "datasets is required".into(),
             )
         })?;
+    if let Some(parameters) = value.get("parameters").and_then(Value::as_array) {
+        for parameter in parameters {
+            if parameter
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|type_name| matches!(type_name.to_ascii_uppercase().as_str(), "DATASET" | "INVALID"))
+            {
+                return Err(error_response("invalid-value", "", "unsupported public XAPI type".into()));
+            }
+        }
+    }
     if datasets.len() > limits.max_datasets {
         return Err(error_response(
             "limit-exceeded",
@@ -934,6 +912,15 @@ fn validate_encode(value: &Value, limits: Limits) -> Result<(), Value> {
             .get("constColumns")
             .and_then(Value::as_array)
             .unwrap();
+        for column in columns.iter().chain(constants.iter()) {
+            if column
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|type_name| matches!(type_name.to_ascii_uppercase().as_str(), "DATASET" | "INVALID"))
+            {
+                return Err(error_response("invalid-value", "", "unsupported public XAPI type".into()));
+            }
+        }
         if columns.len() + constants.len() > limits.max_columns {
             return Err(error_response(
                 "limit-exceeded",
@@ -1210,6 +1197,13 @@ fn canonical(document: &RawDocument, metadata: &Metadata, standalone_original: b
         .as_ref()
         .and_then(|root| root.get("ssv"))
         .is_some();
+    let preserve_original = metadata
+        .root
+        .as_ref()
+        .and_then(|root| root.get("namespace"))
+        .and_then(Value::as_str)
+        .map(|namespace| !namespace.contains("tobesoft"))
+        .unwrap_or(true);
     let parameters = document
         .parameters
         .iter()
@@ -1263,7 +1257,11 @@ fn canonical(document: &RawDocument, metadata: &Metadata, standalone_original: b
                         .and_then(|dataset| dataset.columns.get(id))
                         .and_then(|column| column.wire.clone())
                         .unwrap_or_else(|| wire.to_string());
-                    json!({"id": id, "type": wire, "index": index})
+                    let mut column = json!({"id": id, "type": wire, "index": index});
+                    if let Some(size) = dataset.column_sizes.get(index).and_then(|size| size.clone()) {
+                        column["size"] = Value::String(size);
+                    }
+                    column
                 })
                 .collect::<Vec<_>>();
             let const_columns = dataset
@@ -1281,16 +1279,17 @@ fn canonical(document: &RawDocument, metadata: &Metadata, standalone_original: b
                         .and_then(|dataset| dataset.const_columns.get(id))
                         .and_then(|column| column.wire.clone())
                         .unwrap_or_else(|| wire.to_string());
-                    json!({"id": id, "type": wire, "index": index})
+                    let mut column = json!({"id": id, "type": wire, "index": index});
+                    if let Some(size) = dataset.const_column_sizes.get(index).and_then(|size| size.clone()) {
+                        column["size"] = Value::String(size);
+                    }
+                    column
                 })
                 .collect::<Vec<_>>();
             let rows = dataset
                 .rows
                 .iter()
-                .filter(|row| {
-                    row.row_type != RowType::Delete
-                        && !(standalone_original && row.row_type == RowType::Original)
-                })
+                .filter(|row| !(standalone_original && row.row_type == RowType::Original))
                 .map(|row| {
                     let mut values = row.values.clone();
                     for (id, _, value) in &dataset.const_columns {
@@ -1300,13 +1299,24 @@ fn canonical(document: &RawDocument, metadata: &Metadata, standalone_original: b
                             values.push((id.clone(), value.clone()));
                         }
                     }
+                    let mut materialized = row.clone();
+                    if let Some(original) = materialized.original.as_mut() {
+                        for (id, _, value) in &dataset.const_columns {
+                            if !matches!(value, RawValue::Missing)
+                                && !original.iter().any(|(column, _)| column == id)
+                            {
+                                original.push((id.clone(), value.clone()));
+                            }
+                        }
+                    }
                     canonical_row(
-                        row,
+                        &materialized,
                         &dataset.columns,
                         &values,
                         meta,
                         !metadata.root_nested && !is_ssv,
                         !is_ssv,
+                        preserve_original,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1333,12 +1343,23 @@ fn canonical_row(
     metadata: Option<&DatasetMeta>,
     json_blob: bool,
     fill_missing: bool,
+    preserve_original: bool,
 ) -> Value {
-    json!({
+    let mut result = json!({
         "type": row_type(row.row_type),
         "orgRow": Value::Null,
         "values": canonical_values(values, columns, metadata, json_blob, fill_missing),
-    })
+    });
+    if preserve_original && row.row_type == RowType::Update {
+        if let Some(original) = row.original.as_ref().filter(|values| !values.is_empty()) {
+            result["orgRow"] = json!({
+                "type": "O",
+                "orgRow": Value::Null,
+                "values": canonical_values(original, columns, metadata, json_blob, fill_missing),
+            });
+        }
+    }
+    result
 }
 
 fn canonical_values(
