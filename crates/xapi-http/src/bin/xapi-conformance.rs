@@ -93,7 +93,6 @@ fn handle(line: &str) -> Value {
     match operation {
         "decode" => match input_bytes(&request) {
             Ok(bytes) => {
-
                 if bytes.len() as u64 > limits.max_document_bytes {
                     return error_response(
                         "limit-exceeded",
@@ -886,9 +885,18 @@ fn validate_encode(value: &Value, limits: Limits) -> Result<(), Value> {
             if parameter
                 .get("type")
                 .and_then(Value::as_str)
-                .is_some_and(|type_name| matches!(type_name.to_ascii_uppercase().as_str(), "DATASET" | "INVALID"))
+                .is_some_and(|type_name| {
+                    matches!(
+                        type_name.to_ascii_uppercase().as_str(),
+                        "DATASET" | "INVALID"
+                    )
+                })
             {
-                return Err(error_response("invalid-value", "", "unsupported public XAPI type".into()));
+                return Err(error_response(
+                    "invalid-value",
+                    "",
+                    "unsupported public XAPI type".into(),
+                ));
             }
         }
     }
@@ -916,9 +924,18 @@ fn validate_encode(value: &Value, limits: Limits) -> Result<(), Value> {
             if column
                 .get("type")
                 .and_then(Value::as_str)
-                .is_some_and(|type_name| matches!(type_name.to_ascii_uppercase().as_str(), "DATASET" | "INVALID"))
+                .is_some_and(|type_name| {
+                    matches!(
+                        type_name.to_ascii_uppercase().as_str(),
+                        "DATASET" | "INVALID"
+                    )
+                })
             {
-                return Err(error_response("invalid-value", "", "unsupported public XAPI type".into()));
+                return Err(error_response(
+                    "invalid-value",
+                    "",
+                    "unsupported public XAPI type".into(),
+                ));
             }
         }
         if columns.len() + constants.len() > limits.max_columns {
