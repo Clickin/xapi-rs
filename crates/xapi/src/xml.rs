@@ -827,11 +827,21 @@ pub fn encode<T: XapiRoot, W: Write>(output: W, value: &T) -> Result<()> {
         writer
             .write_event(Event::Start(BytesStart::new("ColumnInfo")))
             .map_err(io_encode)?;
-        for (id, wire) in &dataset.columns {
+        for (index, (id, wire)) in dataset.columns.iter().enumerate() {
             let type_name = wire.to_string();
             let mut column = BytesStart::new("Column");
             column.push_attribute(("id", id.as_str()));
             column.push_attribute(("type", type_name.as_str()));
+            if let Some(size) = dataset
+                .column_sizes
+                .get(index)
+                .and_then(|size| size.as_deref())
+            {
+                column.push_attribute(("size", size));
+            }
+            if *wire == WireType::Blob {
+                column.push_attribute(("encrypt", "base64"));
+            }
             writer
                 .write_event(Event::Empty(column))
                 .map_err(io_encode)?;
@@ -863,6 +873,9 @@ pub fn encode<T: XapiRoot, W: Write>(output: W, value: &T) -> Result<()> {
                     let mut column = BytesStart::new("ConstColumn");
                     column.push_attribute(("id", id.as_str()));
                     column.push_attribute(("type", type_name.as_str()));
+                    if *wire == WireType::Blob {
+                        column.push_attribute(("encrypt", "base64"));
+                    }
                     if let RawValue::Text(value) = raw {
                         column.push_attribute(("value", value.as_str()));
                     }
@@ -1194,11 +1207,14 @@ impl<W: Write> XapiEncodeSink for XmlSink<W> {
             let type_name = field.wire.to_string();
             let mut column = BytesStart::new("ConstColumn");
             column.push_attribute(("id", field.id));
+            column.push_attribute(("type", type_name.as_str()));
             if let Some(size) = field.size {
                 let size = size.to_string();
                 column.push_attribute(("size", size.as_str()));
             }
-            column.push_attribute(("type", type_name.as_str()));
+            if field.wire == WireType::Blob {
+                column.push_attribute(("encrypt", "base64"));
+            }
             column.push_attribute(("value", field.const_value.unwrap_or_default()));
             self.writer
                 .write_event(Event::Empty(column))
@@ -1208,11 +1224,14 @@ impl<W: Write> XapiEncodeSink for XmlSink<W> {
             let type_name = field.wire.to_string();
             let mut column = BytesStart::new("Column");
             column.push_attribute(("id", field.id));
+            column.push_attribute(("type", type_name.as_str()));
             if let Some(size) = field.size {
                 let size = size.to_string();
                 column.push_attribute(("size", size.as_str()));
             }
-            column.push_attribute(("type", type_name.as_str()));
+            if field.wire == WireType::Blob {
+                column.push_attribute(("encrypt", "base64"));
+            }
             self.writer
                 .write_event(Event::Empty(column))
                 .map_err(io_encode)?;
