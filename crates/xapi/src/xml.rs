@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{Read, Write};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -21,6 +22,7 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut document = RawDocument::default();
+    let mut rules = DocumentRules::default();
     let mut dataset: Option<RawDataset> = None;
     let mut row: Option<RawRow> = None;
     let mut in_original = false;
@@ -28,7 +30,11 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
     let mut value = String::new();
     let mut depth = 0usize;
     loop {
-        match reader.read_event_into(&mut buffer) {
+        let event = reader.read_event_into(&mut buffer);
+        if let Ok(event) = &event {
+            rules.check(event)?;
+        }
+        match event {
             Ok(Event::Start(start)) => {
                 depth += 1;
                 if depth > limits.max_depth {
@@ -150,9 +156,11 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
                 }
             }
             Ok(Event::CData(text)) if value_target.is_some() => {
-                value.push_str(std::str::from_utf8(&text).map_err(|error| {
-                    Error::from(DecodeError::message(format!("invalid XML CDATA: {error}")))
-                })?);
+                value.push_str(&normalize_line_endings(
+                    std::str::from_utf8(&text).map_err(|error| {
+                        Error::from(DecodeError::message(format!("invalid XML CDATA: {error}")))
+                    })?,
+                ));
                 if value.len() > limits.max_scalar_bytes {
                     return Err(Error::from(DecodeError::Limit("max_scalar_bytes")));
                 }
@@ -267,21 +275,18 @@ pub fn decode_raw<R: Read>(input: R, limits: Limits) -> Result<RawDocument> {
             "malformed XML: unclosed element",
         )));
     }
+    rules.finish()?;
     Ok(document)
 }
 
-pub fn decode_stream<T: XapiRoot, R: Read>(
-    input: R,
-    format: Format,
-    limits: Limits,
-    strict: bool,
-) -> Result<T> {
+pub fn decode_stream<T: XapiRoot, R: Read>(input: R, limits: Limits, strict: bool) -> Result<T> {
     let mut reader = Reader::from_reader(std::io::BufReader::new(
         input.take(limits.max_document_bytes.saturating_add(1)),
     ));
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut decoder = T::decoder(strict, limits);
+    let mut rules = DocumentRules::default();
     let mut dataset = None::<String>;
     let mut dataset_columns = Vec::<(String, crate::WireType)>::new();
     let mut dataset_const_columns = Vec::<(String, crate::WireType, RawValue)>::new();
@@ -295,7 +300,11 @@ pub fn decode_stream<T: XapiRoot, R: Read>(
     let mut columns = 0usize;
     let mut rows = 0usize;
     loop {
-        match reader.read_event_into(&mut buffer) {
+        let event = reader.read_event_into(&mut buffer);
+        if let Ok(event) = &event {
+            rules.check(event)?;
+        }
+        match event {
             Ok(Event::Start(start)) => {
                 depth += 1;
                 if depth > limits.max_depth {
@@ -453,9 +462,11 @@ pub fn decode_stream<T: XapiRoot, R: Read>(
                 }
             }
             Ok(Event::CData(text)) if value_target.is_some() => {
-                value.push_str(std::str::from_utf8(&text).map_err(|error| {
-                    Error::from(DecodeError::message(format!("invalid XML CDATA: {error}")))
-                })?);
+                value.push_str(&normalize_line_endings(
+                    std::str::from_utf8(&text).map_err(|error| {
+                        Error::from(DecodeError::message(format!("invalid XML CDATA: {error}")))
+                    })?,
+                ));
                 if value.len() > limits.max_scalar_bytes {
                     return Err(Error::from(DecodeError::Limit("max_scalar_bytes")));
                 }
@@ -493,10 +504,6 @@ pub fn decode_stream<T: XapiRoot, R: Read>(
                         };
                         let raw = if is_null(&reader, &start)? {
                             RawValue::Null
-                        } else if matches!(format, Format::XPlatformXml4000) {
-                            let raw = attr(&reader, &start, b"value")?.unwrap_or_default();
-                            enforce_scalar_limit(&raw, limits)?;
-                            RawValue::Text(raw)
                         } else {
                             RawValue::Text(String::new())
                         };
@@ -696,6 +703,7 @@ pub fn decode_stream<T: XapiRoot, R: Read>(
             "malformed XML: unclosed element",
         )));
     }
+    rules.finish()?;
     decoder.finish()
 }
 
@@ -781,10 +789,145 @@ fn append_text<R: Read>(
     let decoded = text
         .decode()
         .map_err(|error| Error::from(DecodeError::message(format!("invalid XML text: {error}"))))?;
-    value.push_str(&unescape(&decoded).map_err(|error| {
-        Error::from(DecodeError::message(format!("invalid XML entity: {error}")))
-    })?);
+    value.push_str(
+        &unescape(&normalize_line_endings(&decoded)).map_err(|error| {
+            Error::from(DecodeError::message(format!("invalid XML entity: {error}")))
+        })?,
+    );
     Ok(())
+}
+
+/// Applies XML line-ending normalization to raw text. Character references are
+/// read separately, so `&#13;` stays a carriage return.
+fn normalize_line_endings(text: &str) -> Cow<'_, str> {
+    if text.contains('\r') {
+        Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// Document-level rules the event reader leaves to its caller.
+#[derive(Default)]
+struct DocumentRules {
+    depth: usize,
+    closed: bool,
+    root_seen: bool,
+    leading_whitespace: bool,
+    prefixes: Vec<(usize, Vec<u8>)>,
+}
+
+impl DocumentRules {
+    fn check(&mut self, event: &Event<'_>) -> Result<()> {
+        match event {
+            Event::Decl(_) if self.leading_whitespace => Err(malformed(
+                "XML declaration must be at the start of the document",
+            )),
+            Event::Start(start) => {
+                self.open(start)?;
+                self.depth += 1;
+                Ok(())
+            }
+            Event::Empty(start) => {
+                self.open(start)?;
+                self.close_scope();
+                Ok(())
+            }
+            Event::End(_) => {
+                self.depth = self.depth.saturating_sub(1);
+                self.close_scope();
+                Ok(())
+            }
+            Event::Text(text) if self.depth == 0 => {
+                if !text
+                    .iter()
+                    .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+                {
+                    return Err(malformed("text outside the root element"));
+                }
+                self.leading_whitespace = !self.closed;
+                Ok(())
+            }
+            Event::CData(_) | Event::GeneralRef(_) if self.depth == 0 => {
+                Err(malformed("text outside the root element"))
+            }
+            Event::GeneralRef(reference) => match reference.resolve_char_ref() {
+                Ok(Some(character)) if !is_xml_char(character) => Err(malformed(
+                    "character reference to a character XML does not allow",
+                )),
+                _ => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    fn open(&mut self, start: &BytesStart<'_>) -> Result<()> {
+        if self.closed {
+            return Err(malformed("more than one root element"));
+        }
+        self.root_seen |= start.local_name().as_ref() == b"Root";
+        // Most elements have no colon anywhere, so they skip the attribute walk.
+        if start.contains(&b':') {
+            self.check_prefixes(start)?;
+        }
+        Ok(())
+    }
+
+    fn close_scope(&mut self) {
+        while self
+            .prefixes
+            .last()
+            .is_some_and(|(depth, _)| *depth >= self.depth)
+        {
+            self.prefixes.pop();
+        }
+        self.closed = self.depth == 0;
+    }
+
+    fn check_prefixes(&mut self, start: &BytesStart<'_>) -> Result<()> {
+        let mut names = vec![start.name().as_ref().to_vec()];
+        for attribute in start.attributes() {
+            let attribute =
+                attribute.map_err(|error| malformed(format!("invalid XML attribute: {error}")))?;
+            let key = attribute.key.as_ref();
+            match key.strip_prefix(b"xmlns:") {
+                Some(prefix) => self.prefixes.push((self.depth, prefix.to_vec())),
+                None => names.push(key.to_vec()),
+            }
+        }
+        for name in &names {
+            let Some(colon) = name.iter().position(|byte| *byte == b':') else {
+                continue;
+            };
+            let prefix = &name[..colon];
+            if prefix != b"xml" && !self.prefixes.iter().any(|(_, known)| known == prefix) {
+                return Err(malformed(format!(
+                    "undeclared XML prefix {:?}",
+                    String::from_utf8_lossy(prefix)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        if self.root_seen {
+            Ok(())
+        } else {
+            Err(malformed("root element must be Root"))
+        }
+    }
+}
+
+fn malformed(message: impl Into<String>) -> Error {
+    Error::from(DecodeError::message(format!(
+        "malformed XML: {}",
+        message.into()
+    )))
+}
+
+fn is_xml_char(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..)
 }
 
 fn enforce_scalar_limit(value: &str, limits: Limits) -> Result<()> {
@@ -920,7 +1063,7 @@ pub fn encode_raw<W: Write>(
         .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
         .map_err(io_encode)?;
     let (namespace, version) = match format {
-        Format::XPlatformXml4000 => ("http://www.tobesoft.com/platform/dataset", Some("5000")),
+        Format::XPlatformXml4000 => ("http://www.tobesoft.com/platform/Dataset", Some("4000")),
         Format::NexacroXml4000 => ("http://www.nexacroplatform.com/platform/dataset", None),
         _ => unreachable!(),
     };
@@ -1156,11 +1299,13 @@ impl<W: Write> XapiEncodeSink for XmlSink<W> {
                 None,
             )))
             .map_err(io_encode)?;
-        let (namespace, version_key) = match self.format {
-            Format::XPlatformXml4000 => ("http://www.tobesoft.com/platform/Dataset", "ver"),
-            Format::NexacroXml4000 => {
-                ("http://www.nexacroplatform.com/platform/dataset", "version")
-            }
+        let (namespace, version_key, version) = match self.format {
+            Format::XPlatformXml4000 => ("http://www.tobesoft.com/platform/Dataset", "ver", "4000"),
+            Format::NexacroXml4000 => (
+                "http://www.nexacroplatform.com/platform/dataset",
+                "version",
+                "4000",
+            ),
             Format::NexacroJson10
             | Format::XPlatformSsv
             | Format::NexacroSsv
@@ -1169,7 +1314,7 @@ impl<W: Write> XapiEncodeSink for XmlSink<W> {
         };
         let mut root = BytesStart::new("Root");
         root.push_attribute(("xmlns", namespace));
-        root.push_attribute((version_key, "4000"));
+        root.push_attribute((version_key, version));
         self.writer
             .write_event(Event::Start(root))
             .map_err(io_encode)?;

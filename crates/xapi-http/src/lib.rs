@@ -173,7 +173,7 @@ where
         http::HeaderValue::from_static(match format {
             Format::NexacroJson10 => "application/json; charset=utf-8",
             Format::XPlatformXml4000 | Format::NexacroXml4000 => "application/xml; charset=utf-8",
-            Format::XPlatformSsv | Format::NexacroSsv => "text/plain; charset=utf-8",
+            Format::NexacroSsv | Format::XPlatformSsv => "application/x-ssv",
             Format::NexacroBinary5000 | Format::XPlatformBinary5000 => "application/octet-stream",
         }),
     );

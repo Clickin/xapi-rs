@@ -388,9 +388,6 @@ fn cell_value(value: &RawValue, format: Format, _wire: Option<&WireType>) -> Str
                 "\x03".into()
             }
         }
-        RawValue::Text(value) if value.is_empty() && matches!(format, Format::XPlatformSsv) => {
-            String::new()
-        }
         RawValue::Text(value) if value.is_empty() => String::new(),
         RawValue::Text(value) => value.clone(),
         RawValue::Bytes(value) => String::from_utf8_lossy(value).into_owned(),

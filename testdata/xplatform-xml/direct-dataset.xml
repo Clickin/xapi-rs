@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Root xmlns="http://www.tobesoft.com/platform/Dataset" ver="4000">
   <Parameters>
-    <Parameter id="ErrorCode" type="INT" value="7"/>
+    <Parameter id="ErrorCode" type="INT">7</Parameter>
     <Parameter id="service">stock</Parameter>
   </Parameters>
   <Dataset id="users">

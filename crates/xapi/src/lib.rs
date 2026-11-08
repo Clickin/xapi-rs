@@ -379,7 +379,7 @@ where
 {
     match format {
         Format::XPlatformXml4000 | Format::NexacroXml4000 => {
-            xml::decode_stream(reader, format, limits, strict)
+            xml::decode_stream(reader, limits, strict)
         }
         Format::NexacroJson10 => json::decode_stream(reader, limits, strict),
         Format::NexacroBinary5000 | Format::XPlatformBinary5000 => {
@@ -958,8 +958,62 @@ mod tests {
         let encoded = String::from_utf8(to_vec(&value, Format::NexacroXml4000).unwrap()).unwrap();
         assert!(encoded.contains("before&#1;&amp;after"), "{encoded}");
         assert!(!encoded.contains("&amp;#1;"), "{encoded}");
-        let decoded: Response = from_slice(encoded.as_bytes(), Format::NexacroXml4000).unwrap();
-        assert_eq!(decoded.users[0].name, "before\u{1}&after");
+        // XML 1.0 does not allow this character, so the reader rejects the reference.
+        assert!(from_slice::<Response>(encoded.as_bytes(), Format::NexacroXml4000).is_err());
+    }
+
+    fn xml_message(body: &str) -> String {
+        format!(
+            r#"<Root><Parameters><Parameter id="ErrorCode">{body}</Parameter></Parameters><Datasets/></Root>"#
+        )
+    }
+
+    #[test]
+    fn xml_reader_rejects_documents_outside_the_rules() {
+        for input in [
+            format!(" <?xml version=\"1.0\"?>{}", xml_message("0")),
+            format!("{}<Root/>", xml_message("0")),
+            format!("{}text", xml_message("0")),
+            xml_message("0").replace("Root", "Other"),
+            xml_message("&#1;"),
+            xml_message("<p:x/>"),
+            xml_message("0").replace("<Datasets/>", r#"<Datasets p:a="1"/>"#),
+        ] {
+            let result = from_slice::<Response>(input.as_bytes(), Format::NexacroXml4000);
+            assert!(result.is_err(), "{input}");
+        }
+        let declared =
+            xml_message("0").replace("<Root>", r#"<Root xmlns:p="urn:p" p:a="1" xml:lang="ko">"#);
+        let response: Response = from_slice(declared.as_bytes(), Format::NexacroXml4000).unwrap();
+        assert_eq!(response.code, 0);
+    }
+
+    #[test]
+    fn xml_reader_normalizes_raw_line_endings_only() {
+        let input = br#"<Root><Parameters><Parameter id="ErrorCode">0</Parameter></Parameters><Datasets><Dataset id="users"><ColumnInfo><Column id="id" type="INT"/><Column id="name" type="STRING"/></ColumnInfo><Rows><Row><Col id="id">1</Col><Col id="name">a"#;
+        let mut input = input.to_vec();
+        input.extend_from_slice(b"\r\nb\rc&#13;d</Col></Row></Rows></Dataset></Datasets></Root>");
+        let response: Response = from_slice(&input, Format::NexacroXml4000).unwrap();
+        assert_eq!(response.users[0].name, "a\nb\nc\rd");
+    }
+
+    #[test]
+    fn xplatform_xml_writes_the_documented_root_and_round_trips() {
+        let value = Response {
+            code: 7,
+            users: vec![UserRow {
+                id: 1,
+                name: "Ada".into(),
+            }],
+        };
+        let encoded = to_vec(&value, Format::XPlatformXml4000).unwrap();
+        let text = String::from_utf8_lossy(&encoded);
+        assert!(
+            text.contains(r#"<Root xmlns="http://www.tobesoft.com/platform/Dataset" ver="4000">"#),
+            "{text}"
+        );
+        let decoded: Response = from_slice(&encoded, Format::XPlatformXml4000).unwrap();
+        assert_eq!(decoded.users[0].name, "Ada");
     }
 
     #[test]

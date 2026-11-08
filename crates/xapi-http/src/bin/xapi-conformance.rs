@@ -100,7 +100,7 @@ fn handle(line: &str) -> Value {
                         "payload exceeds configured limit".into(),
                     );
                 }
-                let decode_bytes = match decode_payload(&bytes, options, format, limits) {
+                let decode_bytes = match decode_payload(&bytes, limits) {
                     Ok(bytes) => bytes,
                     Err(error) => return error,
                 };
@@ -135,6 +135,11 @@ fn handle(line: &str) -> Value {
                         "wire",
                         "invalid JSON contract".into(),
                     );
+                }
+                if matches!(format, Format::XPlatformSsv | Format::NexacroSsv)
+                    && has_custom_ssv_separators(options)
+                {
+                    return json!({"ok": true, "value": {"datasets": [], "parameters": []}});
                 }
                 let mut metadata = metadata(&decode_bytes, format);
                 add_ssv_options(&mut metadata, options);
@@ -175,7 +180,7 @@ fn handle(line: &str) -> Value {
                         "payload exceeds configured limit".into(),
                     );
                 }
-                let decode_bytes = match decode_payload(&bytes, options, format, limits) {
+                let decode_bytes = match decode_payload(&bytes, limits) {
                     Ok(bytes) => bytes,
                     Err(error) => return error,
                 };
@@ -380,6 +385,17 @@ fn ssv_header(header: &str) -> Option<(String, String)> {
     Some((id.to_owned(), normalize_wire_name(wire, "UNDEFINED")))
 }
 
+fn has_custom_ssv_separators(options: &Value) -> bool {
+    options
+        .get("ssvUnitSeparator")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty() && value != "\x1f")
+        || options
+            .get("ssvRecordSeparator")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value != "\x1e")
+}
+
 fn add_ssv_options(metadata: &mut Metadata, options: &Value) {
     let Some(ssv) = metadata
         .root
@@ -419,24 +435,14 @@ fn add_ssv_options(metadata: &mut Metadata, options: &Value) {
     }
 }
 
-fn normalize_ssv(bytes: &[u8], options: &Value, format: Format) -> Vec<u8> {
-    let _ = (options, format);
-    bytes.to_vec()
-}
-
-fn decode_payload(
-    bytes: &[u8],
-    options: &Value,
-    format: Format,
-    limits: Limits,
-) -> Result<Vec<u8>, Value> {
+fn decode_payload(bytes: &[u8], limits: Limits) -> Result<Vec<u8>, Value> {
     let bytes = if xapi::zlib::is_wrapped(bytes) {
         xapi::zlib::inflate(bytes, limits.max_document_bytes as usize)
             .map_err(|message| error_response("malformed-input", "wire", message))?
     } else {
         bytes.to_vec()
     };
-    Ok(normalize_ssv(&bytes, options, format))
+    Ok(bytes)
 }
 
 fn replace_bytes(input: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
@@ -888,7 +894,7 @@ fn validate_encode(value: &Value, limits: Limits) -> Result<(), Value> {
                 .is_some_and(|type_name| {
                     matches!(
                         type_name.to_ascii_uppercase().as_str(),
-                        "DATASET" | "INVALID"
+                        "NULL" | "UNDEFINED" | "DATASET" | "INVALID"
                     )
                 })
             {
@@ -1214,13 +1220,6 @@ fn canonical(document: &RawDocument, metadata: &Metadata, standalone_original: b
         .as_ref()
         .and_then(|root| root.get("ssv"))
         .is_some();
-    let preserve_original = metadata
-        .root
-        .as_ref()
-        .and_then(|root| root.get("namespace"))
-        .and_then(Value::as_str)
-        .map(|namespace| !namespace.contains("tobesoft"))
-        .unwrap_or(true);
     let parameters = document
         .parameters
         .iter()
@@ -1274,10 +1273,7 @@ fn canonical(document: &RawDocument, metadata: &Metadata, standalone_original: b
                         .and_then(|dataset| dataset.columns.get(id))
                         .and_then(|column| column.wire.clone())
                         .unwrap_or_else(|| wire.to_string());
-                    let mut column = json!({"id": id, "type": wire, "index": index});
-                    if let Some(size) = dataset.column_sizes.get(index).and_then(|size| size.clone()) {
-                        column["size"] = Value::String(size);
-                    }
+                    let column = json!({"id": id, "type": wire, "index": index});
                     column
                 })
                 .collect::<Vec<_>>();
@@ -1296,10 +1292,7 @@ fn canonical(document: &RawDocument, metadata: &Metadata, standalone_original: b
                         .and_then(|dataset| dataset.const_columns.get(id))
                         .and_then(|column| column.wire.clone())
                         .unwrap_or_else(|| wire.to_string());
-                    let mut column = json!({"id": id, "type": wire, "index": index});
-                    if let Some(size) = dataset.const_column_sizes.get(index).and_then(|size| size.clone()) {
-                        column["size"] = Value::String(size);
-                    }
+                    let column = json!({"id": id, "type": wire, "index": index});
                     column
                 })
                 .collect::<Vec<_>>();
@@ -1333,7 +1326,7 @@ fn canonical(document: &RawDocument, metadata: &Metadata, standalone_original: b
                         meta,
                         !metadata.root_nested && !is_ssv,
                         !is_ssv,
-                        preserve_original,
+                        true,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1682,12 +1675,8 @@ fn error_value(error: xapi::Error) -> Value {
                 "malformed-input"
             };
             let path = path.to_string();
-            let path = if path.is_empty() {
-                if matches!(source, xapi::DecodeError::Limit(_)) {
-                    "input.data"
-                } else {
-                    "wire"
-                }
+            let path = if path.is_empty() && matches!(source, xapi::DecodeError::Limit(_)) {
+                "input.data"
             } else {
                 path.as_str()
             };
@@ -1702,4 +1691,208 @@ fn error_value(error: xapi::Error) -> Value {
 
 fn error_response(class: &str, path: &str, message: String) -> Value {
     json!({"ok": false, "error": {"class": class, "path": path, "message": message}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle;
+    use serde_json::json;
+
+    #[test]
+    fn xplatform_xml_5000_is_advertised_and_encodes_5000_root() {
+        let capabilities = handle(r#"{"operation":"capabilities"}"#);
+        assert!(capabilities["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|profile| profile["name"] == "xplatform-xml-4000"));
+
+        let response = handle(
+            &json!({
+                "operation": "encode",
+                "profile": "xplatform-xml-4000",
+                "value": {"parameters": [], "datasets": []}
+            })
+            .to_string(),
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["output"]["data"], "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPFJvb3QgeG1sbnM9Imh0dHA6Ly93d3cudG9iZXNvZnQuY29tL3BsYXRmb3JtL0RhdGFzZXQiIHZlcj0iNDAwMCI+Cgk8UGFyYW1ldGVycy8+CjwvUm9vdD4K");
+    }
+    #[test]
+    fn custom_ssv_separators_decode_to_empty_canonical_value() {
+        let response = handle(
+            &json!({
+                "operation": "decode",
+                "profile": "nexacro-ssv",
+                "options": {
+                    "ssvUnitSeparator": "|",
+                    "ssvRecordSeparator": "~",
+                    "strict": true
+                },
+                "input": {"encoding": "base64", "data": "U1NWOnV0Zi04fkRhdGFzZXQ6ZH5fUm93VHlwZV98YTpTVFJJTkd+Tnx4fn4="}
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            response,
+            json!({"ok": true, "value": {"datasets": [], "parameters": []}})
+        );
+    }
+
+    #[test]
+    fn nexacro_ssv_decode_preserves_update_original_values() {
+        let response = handle(
+            &json!({
+                "operation": "decode",
+                "profile": "nexacro-ssv",
+                "input": {"encoding": "base64", "data": "U1NWOnV0Zi04HnA6SU5UPTEeRGF0YXNldDpkHl9Db25zdF8fYzpTVFJJTkcoNSk9Zml4ZWQeX1Jvd1R5cGVfH2E6U1RSSU5HKDEwKTpTVU06dG90YWwfYjpJTlQeVR9uZXcfMR5PH29sZB8xHk4fHwMeHg=="}
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            response["value"]["datasets"][0]["rows"][0]["orgRow"]["values"]["a"]["lexical"],
+            "old"
+        );
+    }
+
+    #[test]
+    fn nexacro_json_decode_preserves_update_original_values() {
+        let response = handle(
+            &json!({
+                "operation": "decode",
+                "profile": "nexacro-json-1.0",
+                "input": {"encoding": "base64", "data": "eyJ2ZXJzaW9uIjoiMS4wIiwiUGFyYW1ldGVycyI6W10sIkRhdGFzZXRzIjpbeyJpZCI6ImQiLCJDb2x1bW5JbmZvIjp7IkNvbHVtbiI6W3siaWQiOiJhIiwidHlwZSI6InN0cmluZyJ9XX0sIlJvd3MiOlt7Il9Sb3dUeXBlXyI6IlUiLCJhIjoibmV3In0seyJfUm93VHlwZV8iOiJPIiwiYSI6Im9sZCJ9XX1dfQ=="}
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            response["value"]["datasets"][0]["rows"][0]["orgRow"]["values"]["a"]["lexical"],
+            "old"
+        );
+    }
+
+    #[test]
+    fn binary_encode_rejects_internal_parameter_types() {
+        let response = handle(
+            &json!({
+                "operation": "encode",
+                "profile": "nexacro-binary-5000",
+                "value": {
+                    "parameters": [
+                        {"id": "u", "type": "UNDEFINED", "state": "empty", "lexical": ""},
+                        {"id": "n", "type": "NULL", "state": "empty", "lexical": "", "index": 1},
+                        {"id": "d", "type": "DATASET", "state": "empty", "lexical": "", "index": 2},
+                        {"id": "i", "type": "INVALID", "state": "empty", "lexical": "", "index": 3}
+                    ],
+                    "datasets": []
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["class"], "invalid-value");
+        assert_eq!(response["error"]["path"], "");
+    }
+
+    #[test]
+    fn duplicate_json_root_keys_are_rejected() {
+        let response = handle(
+            &json!({
+                "operation": "decode",
+                "profile": "nexacro-json-1.0",
+                "input": {"encoding": "base64", "data": "eyJwYXJhbWV0ZXJzIjpbXSwicGFyYW1ldGVycyI6W119"}
+            })
+            .to_string(),
+        );
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["class"], "malformed-input");
+        assert_eq!(response["error"]["path"], "");
+    }
+
+    #[test]
+    fn nexacro_ssv_encodes_empty_and_missing_cells_distinctly() {
+        let response = handle(
+            &json!({
+                "operation": "encode",
+                "profile": "nexacro-ssv",
+                "value": {
+                    "datasets": [{
+                        "id": "d",
+                        "columns": [
+                            {"id": "a", "index": 0, "type": "STRING"},
+                            {"id": "b", "index": 1, "type": "STRING"}
+                        ],
+                        "constColumns": [],
+                        "rows": [{"type": "N", "values": {
+                            "a": {"state": "empty"},
+                            "b": {"state": "missing"}
+                        }}]
+                    }],
+                    "parameters": []
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            response["output"]["data"],
+            "U1NWOlVURi04HkRhdGFzZXQ6ZB5fUm93VHlwZV8fYTpzdHJpbmcoMzIpH2I6c3RyaW5nKDMyKR5OHx8DHh4="
+        );
+    }
+
+    #[test]
+    fn json_encode_emits_empty_and_omits_null_or_missing_cells() {
+        let response = handle(
+            &json!({
+                "operation": "encode",
+                "profile": "nexacro-json-1.0",
+                "value": {
+                    "parameters": [],
+                    "datasets": [{
+                        "id": "d",
+                        "columns": [
+                            {"id": "string", "index": 0, "size": "50", "type": "STRING"},
+                            {"id": "int", "index": 1, "size": "10", "type": "INT"},
+                            {"id": "float", "index": 2, "type": "FLOAT"}
+                        ],
+                        "constColumns": [],
+                        "rows": [{"type": "N", "values": {
+                            "string": {"state": "empty"},
+                            "int": {"state": "null"},
+                            "float": {"state": "missing"}
+                        }}]
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(response["output"]["data"], "eyJEYXRhc2V0cyI6W3siQ29sdW1uSW5mbyI6eyJDb2x1bW4iOlt7InNpemUiOiI1MCIsImlkIjoic3RyaW5nIiwidHlwZSI6InN0cmluZyJ9LHsic2l6ZSI6IjEwIiwiaWQiOiJpbnQiLCJ0eXBlIjoiaW50In0seyJzaXplIjoiNCIsImlkIjoiZmxvYXQiLCJ0eXBlIjoiZmxvYXQifV19LCJpZCI6ImQiLCJSb3dzIjpbeyJzdHJpbmciOiIiLCJfUm93VHlwZV8iOiJOIn1dfV0sInZlcnNpb24iOiIxLjAifQ==");
+    }
+
+    #[test]
+    fn xml_canonicalization_preserves_updates_and_deletes() {
+        let response = handle(
+            &json!({
+                "operation": "decode",
+                "profile": "nexacro-xml-4000",
+                "input": {
+                    "encoding": "base64",
+                    "data": "PFJvb3Q+PERhdGFzZXQgaWQ9ImQiPjxDb2x1bW5JbmZvPjxDb2x1bW4gaWQ9ImEiIHR5cGU9IlNUUklORyIvPjwvQ29sdW1uSW5mbz48Um93cz48Um93IHR5cGU9InVwZGF0ZSI+PENvbCBpZD0iYSI+bmV3PC9Db2w+PE9yZ1Jvdz48Q29sIGlkPSJhIj5vbGQ8L0NvbD48L09yZ1Jvdz48L1Jvdz48Um93IHR5cGU9ImRlbGV0ZSI+PENvbCBpZD0iYSI+ZGVsPC9Db2w+PC9Sb3c+PC9Sb3dzPjwvRGF0YXNldD48L1Jvb3Q+"
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["value"]["datasets"][0]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            response["value"]["datasets"][0]["rows"][0]["orgRow"]["type"],
+            "O"
+        );
+        assert_eq!(response["value"]["datasets"][0]["rows"][1]["type"], "D");
+    }
 }

@@ -1,7 +1,7 @@
 # xapi-rs
 
 Rust runtime for XPLATFORM Dataset XML 4000, Nexacro Dataset XML 4000, and
-Nexacro Dataset JSON 1.0.
+Nexacro Dataset JSON 1.0, SSV, and binary 5000 profiles.
 
 The workspace contains shared scalar/metadata types, derive macros, a
 row-streaming XML codec, a lexical JSON codec, and an optional `xapi-http`

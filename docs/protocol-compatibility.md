@@ -1,8 +1,8 @@
 # Protocol compatibility
 
-The supported profiles are `XPlatformXml4000`, `NexacroXml4000`, and
-`NexacroJson10`. The compatibility matrix will be expanded as public fixtures
-are added; unverified behavior is not silently treated as compatible.
+The runtime supports XPlatform XML 4000, Nexacro XML 4000, and Nexacro JSON
+1.0. The compatibility matrix below records the existing verified codec coverage; the conformance
+adapter additionally exposes SSV and binary profiles.
 
 | Feature | XPlatform XML 4000 | Nexacro XML 4000 | Nexacro JSON 1.0 |
 |---|---|---|---|

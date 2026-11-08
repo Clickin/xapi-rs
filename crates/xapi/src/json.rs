@@ -1492,7 +1492,8 @@ pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Res
                                 let size = dataset
                                     .column_sizes
                                     .get(index)
-                                    .and_then(|size| size.clone())
+                                    .and_then(Option::as_ref)
+                                    .cloned()
                                     .unwrap_or_else(|| json_default_size(*wire).to_owned());
                                 column.insert("size".into(), Value::String(size));
                                 column.insert("id".into(), Value::String(id.clone()));
@@ -1509,7 +1510,8 @@ pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Res
                                 let size = dataset
                                     .const_column_sizes
                                     .get(index)
-                                    .and_then(|size| size.clone())
+                                    .and_then(Option::as_ref)
+                                    .cloned()
                                     .unwrap_or_else(|| json_default_size(*wire).to_owned());
                                 column.insert("size".into(), Value::String(size));
                                 column.insert("id".into(), Value::String(id.clone()));
@@ -1543,21 +1545,22 @@ pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Res
                                                     .iter()
                                                     .find(|(name, _)| name == id)
                                                     .map(|(_, wire)| *wire);
-                                                if matches!(raw, XValue::Missing) {
-                                                    if wire == Some(WireType::Boolean) {
+                                                match raw {
+                                                    XValue::Missing => {
+                                                        if wire == Some(WireType::Boolean) {
+                                                            values.insert(
+                                                                id.clone(),
+                                                                Value::String("0".into()),
+                                                            );
+                                                        }
+                                                    }
+                                                    XValue::Null => {}
+                                                    _ => {
                                                         values.insert(
                                                             id.clone(),
-                                                            Value::String("0".into()),
+                                                            raw_json(raw, wire),
                                                         );
                                                     }
-                                                } else if matches!(raw, XValue::Text(value) if value.is_empty())
-                                                    && wire == Some(WireType::String)
-                                                {
-                                                    values.insert(id.clone(), Value::String(String::new()));
-                                                } else if !matches!(raw, XValue::Null)
-                                                    && !matches!(raw, XValue::Text(value) if value.is_empty())
-                                                {
-                                                    values.insert(id.clone(), raw_json(raw, wire));
                                                 }
                                             }
                                             for (id, wire) in &dataset.columns {
@@ -1587,7 +1590,9 @@ pub fn encode_raw<W: Write>(mut output: W, document: &crate::RawDocument) -> Res
                                                         .unwrap_or(usize::MAX),
                                                 )
                                             });
-                                            Value::Object(entries.into_iter().collect::<Map<_, _>>())
+                                            Value::Object(
+                                                entries.into_iter().collect::<Map<_, _>>(),
+                                            )
                                         })
                                         .collect(),
                                 ),
