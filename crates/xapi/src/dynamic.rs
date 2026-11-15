@@ -28,15 +28,16 @@ pub fn decode<R: Read>(
 }
 
 pub fn encode<W: Write>(writer: W, document: &Document, format: Format) -> Result<()> {
+    use crate::driver;
     match format {
         Format::NexacroBinary5000 | Format::XPlatformBinary5000 => {
-            crate::binary::encode(writer, document)
+            driver::write_binary(writer, document)
         }
-        Format::XPlatformSsv | Format::NexacroSsv => crate::ssv::encode(writer, document, format),
-        Format::XPlatformXml4000 | Format::NexacroXml4000 => {
-            crate::xml::encode_raw(writer, document, format)
-        }
-        Format::NexacroJson10 => crate::json::encode_raw(writer, document),
+        Format::XPlatformSsv => driver::write_ssv(writer, document, true),
+        Format::NexacroSsv => driver::write_ssv(writer, document, false),
+        Format::XPlatformXml4000 => driver::write_xml(writer, document, true),
+        Format::NexacroXml4000 => driver::write_xml(writer, document, false),
+        Format::NexacroJson10 => driver::write_json(writer, document),
     }
 }
 

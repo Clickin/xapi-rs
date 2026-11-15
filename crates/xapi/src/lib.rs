@@ -6,6 +6,7 @@
 extern crate self as xapi;
 
 mod binary;
+pub mod driver;
 mod error;
 mod json;
 mod scalar;
@@ -433,19 +434,7 @@ where
     T: XapiRoot,
     W: std::io::Write,
 {
-    match format {
-        Format::XPlatformXml4000 | Format::NexacroXml4000 => {
-            xml::encode_stream(writer, value, format)
-        }
-        Format::NexacroJson10 => json::encode_stream(writer, value),
-        Format::NexacroBinary5000 | Format::XPlatformBinary5000 => {
-            binary::encode(writer, &value.encode_raw()?)
-        }
-        Format::XPlatformSsv | Format::NexacroSsv => {
-            let document = value.encode_raw()?;
-            ssv::encode(writer, &document, format)
-        }
-    }
+    dynamic::encode(writer, &value.encode_raw()?, format)
 }
 
 pub fn to_vec<T: XapiRoot>(value: &T, format: Format) -> Result<Vec<u8>> {
@@ -955,7 +944,10 @@ mod tests {
                 name: "before\u{1}&after".into(),
             }],
         };
-        let encoded = String::from_utf8(to_vec(&value, Format::NexacroXml4000).unwrap()).unwrap();
+        // The Nexacro driver writes only the predefined entities, so it
+        // cannot write the character; the XPLATFORM driver writes a reference.
+        assert!(to_vec(&value, Format::NexacroXml4000).is_err());
+        let encoded = String::from_utf8(to_vec(&value, Format::XPlatformXml4000).unwrap()).unwrap();
         assert!(encoded.contains("before&#1;&amp;after"), "{encoded}");
         assert!(!encoded.contains("&amp;#1;"), "{encoded}");
         // XML 1.0 does not allow this character, so the reader rejects the reference.
@@ -1073,7 +1065,7 @@ mod tests {
             !encoded.contains("<Col id=\"region\">") && !encoded.contains("<Col id=\"region\"/>")
         );
 
-        let json = br#"{"version":"1.0","Datasets":[{"id":"users","ColumnInfo":{"ConstColumn":[{"id":"region","type":"STRING","size":2,"value":"KR"}],"Column":[]},"Rows":[{"_RowType_":"N"}]}]}"#;
+        let json = br#"{"version":"1.0","Datasets":[{"id":"users","ColumnInfo":{"ConstColumn":[{"id":"region","type":"STRING","size":"2","value":"KR"}],"Column":[]},"Rows":[{"_RowType_":"N"}]}]}"#;
         let response: ConstResponse = from_slice(json, Format::NexacroJson10).unwrap();
         assert_eq!(response.users[0].region, "KR");
         let encoded = to_vec(&response, Format::NexacroJson10).unwrap();
@@ -1214,6 +1206,61 @@ mod tests {
         assert!(!error.contains(secret));
     }
 
+    #[derive(XapiRow)]
+    struct DriverRow {
+        #[xapi(col = "a", wire = "STRING")]
+        a: String,
+    }
+
+    #[derive(XapiRoot)]
+    struct DriverResponse {
+        #[xapi(param = "p", wire = "STRING")]
+        p: String,
+        #[xapi(dataset = "d")]
+        d: Vec<DriverRow>,
+    }
+
+    /// A derived struct encodes to the bytes the original drivers write
+    /// (the conformance vectors driver.*.escape-amp.encode).
+    #[test]
+    fn derived_struct_encodes_driver_bytes() {
+        let value = DriverResponse {
+            p: "a&b".into(),
+            d: vec![DriverRow { a: "a&b".into() }],
+        };
+        let xml = |namespace: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Root xmlns=\"{namespace}>\n\t<Parameters>\n\t\t<Parameter id=\"p\" type=\"string\">a&amp;b</Parameter>\n\t</Parameters>\n\t<Dataset id=\"d\">\n\t\t<ColumnInfo>\n\t\t\t<Column id=\"a\" type=\"string\" size=\"32\"/>\n\t\t</ColumnInfo>\n\t\t<Rows>\n\t\t\t<Row>\n\t\t\t\t<Col id=\"a\">a&amp;b</Col>\n\t\t\t</Row>\n\t\t</Rows>\n\t</Dataset>\n</Root>\n"
+            )
+        };
+        let cases = [
+            (
+                Format::NexacroXml4000,
+                xml("http://www.nexacroplatform.com/platform/dataset\""),
+            ),
+            (
+                Format::XPlatformXml4000,
+                xml("http://www.tobesoft.com/platform/dataset\" ver=\"5000\""),
+            ),
+            (
+                Format::NexacroJson10,
+                r#"{"Datasets":[{"ColumnInfo":{"Column":[{"size":"32","id":"a","type":"string"}]},"id":"d","Rows":[{"a":"a&b","_RowType_":"N"}]}],"Parameters":[{"id":"p","type":"string","value":"a&b"}],"version":"1.0"}"#.to_owned(),
+            ),
+            (
+                Format::NexacroSsv,
+                "SSV:UTF-8\x1ep:string=a&b\x1eDataset:d\x1e_RowType_\x1fa:string(32)\x1eN\x1fa&b\x1e\x1e".to_owned(),
+            ),
+            (
+                Format::XPlatformSsv,
+                "SSV:UTF-8\x1ep:string=a&b\x1eDataset:d\x1e_RowType_\x1fa:string(32)\x1eN\x1fa&b\x1e".to_owned(),
+            ),
+        ];
+        for (format, expected) in cases {
+            let encoded = String::from_utf8(to_vec(&value, format).unwrap()).unwrap();
+            assert_eq!(encoded, expected, "{format:?}");
+        }
+    }
+
     #[test]
     fn presence_preserves_missing_null_and_empty_across_formats() {
         let xml = br#"<Root><Datasets><Dataset id="values"><Rows><Row/><Row><Col id="value" null="true"/></Row><Row><Col id="value"></Col></Row></Rows></Dataset></Datasets></Root>"#;
@@ -1226,9 +1273,12 @@ mod tests {
             assert_eq!(response.values[0].value, Presence::Missing);
             assert_eq!(response.values[1].value, Presence::Null);
             assert_eq!(response.values[2].value, Presence::Value(String::new()));
+            // The drivers write no cell for null, so null reads back as missing.
             let encoded = to_vec(&response, format).unwrap();
             let round_trip: PresenceResponse = from_slice(&encoded, format).unwrap();
-            assert_eq!(round_trip.values, response.values);
+            assert_eq!(round_trip.values[0].value, Presence::Missing);
+            assert_eq!(round_trip.values[1].value, Presence::Missing);
+            assert_eq!(round_trip.values[2].value, Presence::Value(String::new()));
         }
     }
 }

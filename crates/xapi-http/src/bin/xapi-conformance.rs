@@ -11,7 +11,6 @@ use xapi::{dynamic, Format, Limits, RawDataset, RawDocument, RawRow, RawValue, R
 #[derive(Default)]
 struct Metadata {
     root: Option<Value>,
-    root_nested: bool,
     parameters: HashMap<String, ParameterMeta>,
     datasets: HashMap<String, DatasetMeta>,
     nested_dataset_order: Vec<String>,
@@ -21,8 +20,8 @@ struct Metadata {
 #[derive(Default)]
 struct ParameterMeta {
     wire: Option<String>,
-    value_form: Option<String>,
-    index: Option<usize>,
+    /// The declared type as written, upper-cased; None when not declared.
+    declared: Option<String>,
 }
 #[derive(Default)]
 struct DatasetMeta {
@@ -34,6 +33,8 @@ struct DatasetMeta {
 #[derive(Default)]
 struct ColumnMeta {
     wire: Option<String>,
+    /// The declared type as written, upper-cased; None when not declared.
+    declared: Option<String>,
 }
 
 fn main() {
@@ -143,13 +144,12 @@ fn handle(line: &str) -> Value {
                 }
                 let mut metadata = metadata(&decode_bytes, format);
                 add_ssv_options(&mut metadata, options);
-                let standalone_original = json_has_standalone_original(&decode_bytes, format);
                 match dynamic::decode(decode_bytes.as_slice(), format, limits, strict) {
                     Ok(document) if has_unknown_declared_columns(&document, &metadata) => {
                         error_response("malformed-input", "wire", "column is not declared".into())
                     }
                     Ok(document) => {
-                        json!({"ok": true, "value": canonical(&document, &metadata, standalone_original)})
+                        json!({"ok": true, "value": canonical(&document, &metadata, format)})
                     }
                     Err(error) => error_value(error),
                 }
@@ -160,12 +160,15 @@ fn handle(line: &str) -> Value {
             Some(value) => match validate_encode(value, Limits::default()) {
                 Err(error) => error,
                 Ok(()) => match canonical_document(value) {
-                    Some(document) => match encode_result(&document, format, options) {
-                        Ok(output) => {
-                            json!({"ok": true, "value": request["value"], "output": output})
+                    Some(mut document) => {
+                        apply_save_types(&mut document, value);
+                        match encode_result(&document, format, options) {
+                            Ok(output) => {
+                                json!({"ok": true, "value": request["value"], "output": output})
+                            }
+                            Err(error) => error_value(error),
                         }
-                        Err(error) => error_value(error),
-                    },
+                    }
                     None => error_response("invalid-request", "", "value is required".into()),
                 },
             },
@@ -186,16 +189,19 @@ fn handle(line: &str) -> Value {
                 };
                 let mut metadata = metadata(&decode_bytes, format);
                 add_ssv_options(&mut metadata, options);
-                let standalone_original = json_has_standalone_original(&decode_bytes, format);
                 match dynamic::decode(decode_bytes.as_slice(), format, limits, strict) {
-                    Ok(document) => match encode_result(&document, format, options) {
-                        Ok(output) => json!({
-                            "ok": true,
-                            "value": canonical(&document, &metadata, standalone_original),
-                            "output": output
-                        }),
-                        Err(error) => error_value(error),
-                    },
+                    Ok(document) => {
+                        let mut saved = document.clone();
+                        apply_save_types(&mut saved, &Value::Null);
+                        match encode_result(&saved, format, options) {
+                            Ok(output) => json!({
+                                "ok": true,
+                                "value": canonical(&document, &metadata, format),
+                                "output": output
+                            }),
+                            Err(error) => error_value(error),
+                        }
+                    }
                     Err(error) => error_value(error),
                 }
             }
@@ -331,7 +337,13 @@ fn ssv_metadata(bytes: &[u8]) -> Metadata {
                             .entry(id.clone())
                             .or_default()
                             .const_columns
-                            .insert(column, ColumnMeta { wire: Some(wire) });
+                            .insert(
+                                column,
+                                ColumnMeta {
+                                    declared: Some(ssv_type(header, false)),
+                                    wire: Some(wire),
+                                },
+                            );
                     }
                 }
             }
@@ -351,7 +363,16 @@ fn ssv_metadata(bytes: &[u8]) -> Metadata {
                             .entry(id.clone())
                             .or_default()
                             .columns
-                            .insert(column, ColumnMeta { wire: Some(wire) });
+                            .insert(
+                                column,
+                                ColumnMeta {
+                                    declared: Some(ssv_type(
+                                        &parts[..parts.len().min(2)].join(":"),
+                                        parts.len() > 2,
+                                    )),
+                                    wire: Some(wire),
+                                },
+                            );
                     }
                 }
             }
@@ -365,9 +386,8 @@ fn ssv_metadata(bytes: &[u8]) -> Metadata {
                     result.parameters.insert(
                         id,
                         ParameterMeta {
+                            declared: Some(ssv_type(header, false)),
                             wire: Some(wire),
-                            value_form: variable.contains('=').then(|| "value".into()),
-                            index: None,
                         },
                     );
                 }
@@ -383,6 +403,58 @@ fn ssv_header(header: &str) -> Option<(String, String)> {
     };
     let wire = typed.split('(').next().unwrap_or_default().trim();
     Some((id.to_owned(), normalize_wire_name(wire, "UNDEFINED")))
+}
+
+/// The type of an SSV typed name as the drivers read it: no type is STRING,
+/// FLOAT reads as DOUBLE, DECIMAL and unknown types as UNDEFINED, and a
+/// column with a third field but no size as UNDEFINED.
+fn ssv_type(header: &str, extra_field: bool) -> String {
+    let Some((_, typed)) = header.split_once(':') else {
+        return "STRING".into();
+    };
+    if extra_field && !typed.contains('(') {
+        return "UNDEFINED".into();
+    }
+    let name = typed
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    match name.as_str() {
+        "" => "STRING".into(),
+        "FLOAT" => "DOUBLE".into(),
+        "DECIMAL" => "UNDEFINED".into(),
+        _ if known_type(&name) => name,
+        _ => "UNDEFINED".into(),
+    }
+}
+
+fn known_type(name: &str) -> bool {
+    matches!(
+        name,
+        "STRING"
+            | "CHAR"
+            | "SHORT"
+            | "USHORT"
+            | "INT"
+            | "UINT"
+            | "LONG"
+            | "ULONG"
+            | "FLOAT"
+            | "DOUBLE"
+            | "DECIMAL"
+            | "BIGDECIMAL"
+            | "BOOLEAN"
+            | "DATE"
+            | "TIME"
+            | "DATETIME"
+            | "BLOB"
+            | "FILE"
+            | "NULL"
+            | "UNDEFINED"
+            | "DATASET"
+            | "INVALID"
+    )
 }
 
 fn has_custom_ssv_separators(options: &Value) -> bool {
@@ -482,15 +554,14 @@ fn json_metadata(bytes: &[u8]) -> Metadata {
                 result.parameters.insert(
                     id.to_owned(),
                     ParameterMeta {
+                        declared: object
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .map(str::to_ascii_uppercase),
                         wire: object
                             .get("type")
                             .and_then(Value::as_str)
                             .map(|value| normalize_wire_name(value, "UNDEFINED")),
-                        value_form: None,
-                        index: object
-                            .get("index")
-                            .and_then(Value::as_u64)
-                            .and_then(|index| usize::try_from(index).ok()),
                     },
                 );
                 if result
@@ -559,6 +630,10 @@ fn add_json_column(target: &mut HashMap<String, ColumnMeta>, value: &Value) {
     target.insert(
         id.to_owned(),
         ColumnMeta {
+            declared: object
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_uppercase),
             wire: object
                 .get("type")
                 .and_then(Value::as_str)
@@ -617,10 +692,7 @@ fn normalize_wire_name(value: &str, default: &str) -> String {
 
 #[allow(clippy::while_let_loop)]
 fn xml_metadata(bytes: &[u8]) -> Metadata {
-    let mut result = Metadata {
-        root_nested: true,
-        ..Metadata::default()
-    };
+    let mut result = Metadata::default();
     let mut reader = Reader::from_reader(bytes);
     reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
@@ -670,6 +742,8 @@ fn xml_metadata(bytes: &[u8]) -> Metadata {
                             result.parameters.insert(
                                 id,
                                 ParameterMeta {
+                                    declared: xml_attr(&start, b"type")
+                                        .map(|value| value.to_ascii_uppercase()),
                                     wire: Some(
                                         if xml_attr(&start, b"type").as_deref().is_some_and(
                                             |wire| wire.eq_ignore_ascii_case("DECIMAL"),
@@ -682,12 +756,6 @@ fn xml_metadata(bytes: &[u8]) -> Metadata {
                                             )
                                         },
                                     ),
-                                    value_form: Some(if xml_attr(&start, b"value").is_some() {
-                                        "attribute".into()
-                                    } else {
-                                        "text".into()
-                                    }),
-                                    index: None,
                                 },
                             );
                         }
@@ -697,6 +765,8 @@ fn xml_metadata(bytes: &[u8]) -> Metadata {
                             (dataset.as_ref(), xml_attr(&start, b"id"))
                         {
                             let column = ColumnMeta {
+                                declared: xml_attr(&start, b"type")
+                                    .map(|value| value.to_ascii_uppercase()),
                                 wire: Some(normalize_wire_name(
                                     xml_attr(&start, b"type").as_deref().unwrap_or(""),
                                     "UNDEFINED",
@@ -854,13 +924,6 @@ fn has_unknown_declared_columns(document: &RawDocument, metadata: &Metadata) -> 
 }
 
 fn validate_encode(value: &Value, limits: Limits) -> Result<(), Value> {
-    if value.get("saveType").is_some() {
-        return Err(error_response(
-            "malformed-input",
-            "",
-            "saveType is not supported by the protocol".into(),
-        ));
-    }
     if let Some(parameters) = value.get("parameters").and_then(Value::as_array) {
         for (index, parameter) in parameters.iter().enumerate() {
             if parameter
@@ -1034,396 +1097,361 @@ fn validate_cells(
     Ok(())
 }
 
-fn json_has_standalone_original(bytes: &[u8], format: Format) -> bool {
-    if format != Format::NexacroJson10 {
-        return false;
+/// The decode rules of a profile.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Xml,
+    Json,
+    Ssv { xplatform: bool },
+    Binary,
+}
+
+impl Kind {
+    fn of(format: Format) -> Self {
+        match format {
+            Format::NexacroJson10 => Kind::Json,
+            Format::XPlatformXml4000 | Format::NexacroXml4000 => Kind::Xml,
+            Format::XPlatformSsv => Kind::Ssv { xplatform: true },
+            Format::NexacroSsv => Kind::Ssv { xplatform: false },
+            Format::NexacroBinary5000 | Format::XPlatformBinary5000 => Kind::Binary,
+        }
     }
-    let Ok(root) = serde_json::from_slice::<Value>(bytes) else {
-        return false;
-    };
-    root.get("Datasets")
-        .or_else(|| root.get("datasets"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|dataset| dataset.get("Rows").or_else(|| dataset.get("rows")))
-        .filter_map(Value::as_array)
-        .flatten()
-        .any(|row| row.get("_RowType_").and_then(Value::as_str) == Some("O"))
 }
 
-fn normalize_lenient_datetime(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let component = |offset: usize, length: usize| -> i64 {
-        bytes[offset..offset + length]
-            .iter()
-            .fold(0_i64, |number, byte| {
-                number * 10 + i64::from(*byte) - i64::from(b'0')
-            })
-    };
-    let year = component(0, 4);
-    let mut cycles = (year - 2000) / 400;
-    if year < 2000 && (year - 2000) % 400 != 0 {
-        cycles -= 1;
-    }
-    let base_year = year - cycles * 400;
-    let month = component(4, 2);
-    let day = component(6, 2);
-    let hour = component(8, 2);
-    let minute = component(10, 2);
-    let second = component(12, 2);
-
-    let month_zero = month - 1;
-    let normalized_year = base_year + month_zero.div_euclid(12);
-    let normalized_month = month_zero.rem_euclid(12) + 1;
-    let date = days_from_civil(normalized_year, normalized_month, 1) + day - 1;
-    let (mut output_year, mut output_month, mut output_day) = civil_from_days(date);
-    let seconds = hour * 3600 + minute * 60 + second;
-    let day_delta = seconds.div_euclid(86_400);
-    let seconds = seconds.rem_euclid(86_400);
-    let (hour, remainder) = (seconds / 3600, seconds % 3600);
-    let (minute, second) = (remainder / 60, remainder % 60);
-    if day_delta != 0 {
-        (output_year, output_month, output_day) = civil_from_days(date + day_delta);
-    }
-    output_year += cycles * 400;
-    format!("{output_year:04}{output_month:02}{output_day:02}{hour:02}{minute:02}{second:02}000")
-}
-
-fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
-    year -= i64::from(month <= 2);
-    let era = (if year >= 0 { year } else { year - 399 }) / 400;
-    let year_of_era = year - era * 400;
-    let month_prime = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
-fn civil_from_days(mut days: i64) -> (i64, i64, i64) {
-    days += 719_468;
-    let era = (if days >= 0 { days } else { days - 146_096 }) / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (year, month, day)
-}
-
-fn cell_for(value: &RawValue, wire: Option<&str>, json_blob: bool) -> Value {
-    let value = if json_blob && wire.is_some_and(|wire| wire.eq_ignore_ascii_case("BLOB")) {
-        match value {
-            RawValue::Text(value) => RawValue::Bytes(value.as_bytes().to_vec()),
-            _ => value.clone(),
-        }
-    } else {
-        value.clone()
-    };
-    let value = match (&value, wire.map(str::to_ascii_uppercase).as_deref()) {
-        (RawValue::Text(value), Some("BLOB")) if STANDARD.decode(value.as_bytes()).is_err() => {
-            RawValue::Null
-        }
-        (RawValue::Text(value), Some("DECIMAL"))
-            if value.eq_ignore_ascii_case("nan")
-                || value.eq_ignore_ascii_case("infinity")
-                || value.eq_ignore_ascii_case("+infinity")
-                || value.eq_ignore_ascii_case("-infinity") =>
-        {
-            RawValue::Text(value.clone())
-        }
-        (RawValue::Text(value), Some("BIGDECIMAL"))
-            if value.eq_ignore_ascii_case("nan")
-                || value.eq_ignore_ascii_case("infinity")
-                || value.eq_ignore_ascii_case("+infinity")
-                || value.eq_ignore_ascii_case("-infinity") =>
-        {
-            RawValue::Null
-        }
-        (RawValue::Text(value), Some("FLOAT" | "DOUBLE")) if value.parse::<f64>().is_ok() => {
-            let mut normalized = value.parse::<f64>().unwrap().to_string();
-            if !normalized.contains(['.', 'e', 'E'])
-                && normalized != "NaN"
-                && !normalized.contains("inf")
-            {
-                normalized.push_str(".0");
-            }
-            RawValue::Text(normalized)
-        }
-        (RawValue::Text(value), Some("INT" | "SHORT" | "USHORT" | "UINT"))
-            if value.parse::<i64>().is_err() =>
-        {
-            RawValue::Text("0".into())
-        }
-        (RawValue::Text(value), Some("FLOAT" | "DOUBLE")) if value.parse::<f64>().is_err() => {
-            RawValue::Text("0.0".into())
-        }
-        (RawValue::Text(value), Some("DATE"))
-            if value.len() != 8 || value.parse::<u64>().is_err() =>
-        {
-            RawValue::Null
-        }
-        (RawValue::Text(value), Some("TIME")) if value.len() == 6 => {
-            RawValue::Text(format!("{value}000"))
-        }
-        (RawValue::Text(value), Some("TIME"))
-            if !matches!(value.len(), 6 | 9) || value.parse::<u64>().is_err() =>
-        {
-            RawValue::Null
-        }
-        (RawValue::Text(value), Some("DATETIME")) if value.len() == 14 => {
-            RawValue::Text(normalize_lenient_datetime(value))
-        }
-        (RawValue::Text(value), Some("DATETIME"))
-            if !matches!(value.len(), 14 | 17) || value.parse::<u64>().is_err() =>
-        {
-            RawValue::Null
-        }
-        _ => value,
-    };
-    cell(&value)
-}
-
-fn cell(value: &RawValue) -> Value {
+/// The lexical of a decoded value; None for null or missing.
+fn lexical(value: &RawValue) -> Option<String> {
     match value {
-        RawValue::Missing => json!({"state": "missing"}),
-        RawValue::Null => json!({"state": "null"}),
-        RawValue::Text(value) if value.is_empty() => json!({"state": "empty", "lexical": ""}),
-        RawValue::Text(value) => json!({"state": "value", "lexical": value}),
-        RawValue::Bytes(value) => json!({
-            "state": "value",
-            "lexical": STANDARD.encode(value),
-        }),
+        RawValue::Missing | RawValue::Null => None,
+        RawValue::Text(text) => Some(text.clone()),
+        RawValue::Bytes(bytes) => Some(STANDARD.encode(bytes)),
     }
 }
 
-fn infer_wire(value: &RawValue) -> WireType {
-    match value {
-        RawValue::Bytes(_) => WireType::Blob,
-        RawValue::Text(value)
-            if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") =>
-        {
-            WireType::Boolean
-        }
-        RawValue::Text(value) if value.parse::<i64>().is_ok() => WireType::Int,
-        RawValue::Text(value) if value.parse::<f64>().is_ok() => WireType::Float,
-        _ => WireType::String,
+/// A canonical cell for a lexical: null, empty, or a value.
+fn state_cell(lexical: Option<&str>) -> Value {
+    match lexical {
+        None => json!({"state": "null"}),
+        Some("") => json!({"state": "empty", "lexical": ""}),
+        Some(text) => json!({"state": "value", "lexical": text}),
     }
 }
-fn canonical(document: &RawDocument, metadata: &Metadata, standalone_original: bool) -> Value {
-    let is_ssv = metadata
-        .root
-        .as_ref()
-        .and_then(|root| root.get("ssv"))
-        .is_some();
-    let parameters = document
-        .parameters
-        .iter()
-        .enumerate()
-        .filter(|(_, (id, value))| {
-            !(is_ssv
-                && (matches!(value, RawValue::Missing)
-                    || metadata
-                        .parameters
-                        .get(id)
-                        .is_none_or(|meta| meta.value_form.is_none())))
-        })
-        .map(|(_index, (id, value))| {
-            let wire = metadata
-                .parameters
-                .get(id)
-                .and_then(|meta| meta.wire.clone())
-                .unwrap_or_else(|| infer_wire(value).to_string());
-            let value = if !is_ssv && matches!(value, RawValue::Missing) {
-                &RawValue::Null
-            } else {
-                value
-            };
-            let mut result = cell_for(value, Some(&wire), !metadata.root_nested && !is_ssv);
-            let object = result.as_object_mut().unwrap();
-            object.insert("id".into(), Value::String(id.clone()));
-            object.insert("type".into(), Value::String(wire));
-            if let Some(index) = metadata.parameters.get(id).and_then(|meta| meta.index) {
-                object.insert("index".into(), json!(index));
+
+/// A decoded value as the driver's typed setter converts it: an invalid
+/// BIGDECIMAL, date or BLOB reads as null.
+fn typed_cell(data_type: &str, lexical: Option<&str>) -> Value {
+    match lexical {
+        None => state_cell(None),
+        Some(text) => state_cell(xapi::driver::decode(data_type, text).as_deref()),
+    }
+}
+
+/// A BLOB parameter read from a text format: the bytes of the text itself.
+fn text_blob_cell(lexical: Option<&str>) -> Value {
+    state_cell(lexical.map(xapi::driver::text_blob).as_deref())
+}
+
+/// A declared column type as the drivers report it: FLOAT reads as DOUBLE,
+/// DECIMAL and unknown types as UNDEFINED.
+fn decoded_type(declared: Option<&str>, missing: &str) -> String {
+    let name = declared.unwrap_or_default().to_ascii_uppercase();
+    match name.as_str() {
+        "" => missing.to_owned(),
+        "FLOAT" => "DOUBLE".into(),
+        "DECIMAL" => "UNDEFINED".into(),
+        _ if known_type(&name) => name,
+        _ => "UNDEFINED".into(),
+    }
+}
+
+/// An XML parameter type: no, DECIMAL or unknown type reads as STRING.
+fn xml_parameter_type(declared: Option<&str>) -> String {
+    let name = declared.unwrap_or_default().to_ascii_uppercase();
+    match name.as_str() {
+        "FLOAT" => "DOUBLE".into(),
+        "" | "DECIMAL" => "STRING".into(),
+        _ if known_type(&name) => name,
+        _ => "STRING".into(),
+    }
+}
+
+fn ssv_numeric(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "SHORT" | "USHORT" | "INT" | "UINT" | "LONG" | "ULONG" | "FLOAT" | "DOUBLE"
+    )
+}
+
+fn canonical(document: &RawDocument, metadata: &Metadata, format: Format) -> Value {
+    let kind = Kind::of(format);
+    let mut parameters: Vec<Value> = Vec::new();
+    for (index, (id, value)) in document.parameters.iter().enumerate() {
+        let declared = metadata
+            .parameters
+            .get(id)
+            .and_then(|meta| meta.declared.as_deref());
+        let (data_type, cell) = match kind {
+            Kind::Binary => {
+                let data_type = document
+                    .parameter_wires
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| "UNDEFINED".into());
+                (data_type, state_cell(lexical(value).as_deref()))
             }
-            Value::Object(object.clone())
-        })
-        .collect::<Vec<_>>();
+            Kind::Xml => {
+                // The XML readers take the element text; no text is empty.
+                let text = lexical(value).unwrap_or_default();
+                let data_type = xml_parameter_type(declared);
+                let cell = if xapi::driver::is_blob(&data_type) {
+                    text_blob_cell(Some(&text))
+                } else {
+                    typed_cell(&data_type, Some(&text))
+                };
+                (data_type, cell)
+            }
+            Kind::Json => {
+                let text = lexical(value);
+                let mut data_type = decoded_type(declared, "STRING");
+                // Variable.set gives an untyped variable the string type; a
+                // null value is never set.
+                if data_type == "UNDEFINED" && text.is_some() {
+                    data_type = "STRING".into();
+                }
+                let cell = if xapi::driver::is_blob(&data_type) {
+                    text_blob_cell(text.as_deref())
+                } else {
+                    typed_cell(&data_type, text.as_deref())
+                };
+                (data_type, cell)
+            }
+            Kind::Ssv { .. } => {
+                // A variable without '=' is not set.
+                if matches!(value, RawValue::Missing) {
+                    continue;
+                }
+                let mut data_type = declared.unwrap_or("STRING").to_owned();
+                if data_type == "UNDEFINED" {
+                    data_type = "STRING".into();
+                }
+                let mut text = lexical(value);
+                if text.is_none() && ssv_numeric(&data_type) {
+                    // Variable.set converts the null marker like an empty number.
+                    text = Some(String::new());
+                }
+                let cell = if xapi::driver::is_blob(&data_type) {
+                    text_blob_cell(text.as_deref())
+                } else {
+                    typed_cell(&data_type, text.as_deref())
+                };
+                if let Some(position) = parameters
+                    .iter()
+                    .position(|parameter| parameter["id"] == *id)
+                {
+                    parameters.remove(position);
+                }
+                (data_type, cell)
+            }
+        };
+        let mut parameter = Map::new();
+        parameter.insert("id".into(), Value::String(id.clone()));
+        parameter.insert("type".into(), Value::String(data_type));
+        parameter.extend(cell.as_object().cloned().unwrap_or_default());
+        parameters.push(Value::Object(parameter));
+    }
     let datasets = document
         .datasets
         .iter()
-        .map(|dataset| {
-            let meta = metadata.datasets.get(&dataset.id);
-            let const_first = meta.map(|meta| meta.const_first).unwrap_or(false);
-            let columns = dataset
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(index, (id, wire))| {
-                    let index = if const_first {
-                        dataset.const_columns.len() + index
-                    } else {
-                        index
-                    };
-                    let wire = meta
-                        .and_then(|dataset| dataset.columns.get(id))
-                        .and_then(|column| column.wire.clone())
-                        .unwrap_or_else(|| wire.to_string());
-                    let column = json!({"id": id, "type": wire, "index": index});
-                    column
-                })
-                .collect::<Vec<_>>();
-            let const_columns = dataset
-                .const_columns
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, _, value))| !(is_ssv && matches!(value, RawValue::Missing)))
-                .map(|(index, (id, wire, _value))| {
-                    let index = if const_first {
-                        index
-                    } else {
-                        dataset.columns.len() + index
-                    };
-                    let wire = meta
-                        .and_then(|dataset| dataset.const_columns.get(id))
-                        .and_then(|column| column.wire.clone())
-                        .unwrap_or_else(|| wire.to_string());
-                    let column = json!({"id": id, "type": wire, "index": index});
-                    column
-                })
-                .collect::<Vec<_>>();
-            let rows = dataset
-                .rows
-                .iter()
-                .filter(|row| !(standalone_original && row.row_type == RowType::Original))
-                .map(|row| {
-                    let mut values = row.values.clone();
-                    for (id, _, value) in &dataset.const_columns {
-                        if !matches!(value, RawValue::Missing)
-                            && !values.iter().any(|(column, _)| column == id)
-                        {
-                            values.push((id.clone(), value.clone()));
-                        }
-                    }
-                    let mut materialized = row.clone();
-                    if let Some(original) = materialized.original.as_mut() {
-                        for (id, _, value) in &dataset.const_columns {
-                            if !matches!(value, RawValue::Missing)
-                                && !original.iter().any(|(column, _)| column == id)
-                            {
-                                original.push((id.clone(), value.clone()));
-                            }
-                        }
-                    }
-                    canonical_row(
-                        &materialized,
-                        &dataset.columns,
-                        &values,
-                        meta,
-                        !metadata.root_nested && !is_ssv,
-                        !is_ssv,
-                        true,
-                    )
-                })
-                .collect::<Vec<_>>();
-            json!({"id": dataset.id, "columns": columns, "constColumns": const_columns, "rows": rows})
-        })
+        .map(|dataset| canonical_dataset(dataset, metadata.datasets.get(&dataset.id), kind))
         .collect::<Vec<_>>();
     let mut result = json!({"parameters": parameters, "datasets": datasets});
-    if let Some(root) = &metadata.root {
-        if !is_ssv && root.get("format").is_none() {
-            result["wire"] = if metadata.root_nested {
-                json!({"root": root})
+    match kind {
+        Kind::Xml => {
+            if let Some(root) = &metadata.root {
+                result["wire"] = json!({"root": root});
+            }
+        }
+        Kind::Json => result["wire"] = json!({"version": "1.0"}),
+        _ => {}
+    }
+    result
+}
+
+fn canonical_dataset(dataset: &RawDataset, meta: Option<&DatasetMeta>, kind: Kind) -> Value {
+    let declared = |id: &str, constant: bool| -> Option<String> {
+        meta.and_then(|meta| {
+            if constant {
+                meta.const_columns.get(id)
             } else {
-                root.clone()
-            };
-        }
-    }
-    result
-}
-
-fn canonical_row(
-    row: &RawRow,
-    columns: &[(String, WireType)],
-    values: &[(String, RawValue)],
-    metadata: Option<&DatasetMeta>,
-    json_blob: bool,
-    fill_missing: bool,
-    preserve_original: bool,
-) -> Value {
-    let mut result = json!({
-        "type": row_type(row.row_type),
-        "orgRow": Value::Null,
-        "values": canonical_values(values, columns, metadata, json_blob, fill_missing),
-    });
-    if preserve_original && row.row_type == RowType::Update {
-        if let Some(original) = row.original.as_ref().filter(|values| !values.is_empty()) {
-            result["orgRow"] = json!({
-                "type": "O",
-                "orgRow": Value::Null,
-                "values": canonical_values(original, columns, metadata, json_blob, fill_missing),
-            });
-        }
-    }
-    result
-}
-
-fn canonical_values(
-    values: &[(String, RawValue)],
-    columns: &[(String, WireType)],
-    metadata: Option<&DatasetMeta>,
-    json_blob: bool,
-    fill_missing: bool,
-) -> Map<String, Value> {
-    let mut result = values
-        .iter()
-        .map(|(id, value)| {
-            let source_wire = columns
-                .iter()
-                .find(|(column, _)| column == id)
-                .map(|(_, wire)| wire.to_string());
-            let wire = metadata
-                .and_then(|metadata| metadata.columns.get(id))
-                .and_then(|column| column.wire.clone())
-                .or_else(|| {
-                    metadata
-                        .and_then(|metadata| metadata.const_columns.get(id))
-                        .and_then(|column| column.wire.clone())
-                })
-                .or_else(|| source_wire.clone());
-            let validation_wire = source_wire.or_else(|| wire.clone());
-            (
-                id.clone(),
-                cell_for(value, validation_wire.as_deref(), json_blob),
-            )
+                meta.columns.get(id)
+            }
         })
-        .collect::<Map<_, _>>();
-    if fill_missing {
-        if let Some(metadata) = metadata {
-            for (id, column) in metadata.columns.iter().chain(metadata.const_columns.iter()) {
-                if !result.contains_key(id) {
-                    result.insert(
-                        id.clone(),
-                        cell_for(&RawValue::Null, column.wire.as_deref(), json_blob),
-                    );
-                }
+        .and_then(|column| column.declared.clone())
+    };
+    let column_count = dataset.columns.len();
+    let const_count = dataset.const_columns.len();
+    let const_first = meta.is_some_and(|meta| meta.const_first);
+    // Canonical type, and the type a row value is converted by.
+    let column_types = dataset
+        .columns
+        .iter()
+        .map(|(id, wire)| match kind {
+            Kind::Binary => (wire.to_string(), wire.to_string()),
+            Kind::Xml => {
+                let raw = declared(id, false);
+                (
+                    decoded_type(raw.as_deref(), "UNDEFINED"),
+                    raw.unwrap_or_default(),
+                )
             }
-        } else {
-            for (id, wire) in columns {
-                if !result.contains_key(id) {
-                    result.insert(
-                        id.clone(),
-                        cell_for(&RawValue::Null, Some(&wire.to_string()), json_blob),
-                    );
+            Kind::Json => {
+                let data_type = decoded_type(declared(id, false).as_deref(), "STRING");
+                (data_type.clone(), data_type)
+            }
+            Kind::Ssv { xplatform } => {
+                let data_type = declared(id, false).unwrap_or_else(|| "STRING".into());
+                // Nexacro SSV columns base64-decode BLOB text; XPLATFORM SSV
+                // keeps the bytes of the text itself.
+                let decode = if xplatform && xapi::driver::is_blob(&data_type) {
+                    "TEXT_BLOB".to_owned()
+                } else {
+                    data_type.clone()
+                };
+                (data_type, decode)
+            }
+        })
+        .collect::<Vec<_>>();
+    let columns = dataset
+        .columns
+        .iter()
+        .zip(&column_types)
+        .enumerate()
+        .map(|(index, ((id, _), (data_type, _)))| {
+            let index = match kind {
+                Kind::Binary => const_count + index,
+                Kind::Xml if const_first => const_count + index,
+                _ => index,
+            };
+            json!({"id": id, "type": data_type, "index": index})
+        })
+        .collect::<Vec<_>>();
+    let mut const_columns = Vec::new();
+    let mut constants: Vec<(String, Value)> = Vec::new();
+    for (index, (id, wire, value)) in dataset.const_columns.iter().enumerate() {
+        let index = match kind {
+            Kind::Binary => index,
+            Kind::Xml if const_first => index,
+            _ => column_count + index,
+        };
+        let raw = declared(id, true);
+        let data_type = match kind {
+            // Only the null tags carry no value; they read as UNDEFINED.
+            Kind::Binary if matches!(value, RawValue::Null) => "UNDEFINED".into(),
+            Kind::Binary => wire.to_string(),
+            Kind::Xml => decoded_type(raw.as_deref(), "UNDEFINED"),
+            Kind::Json => decoded_type(raw.as_deref(), "STRING"),
+            Kind::Ssv { .. } => raw.clone().unwrap_or_else(|| "STRING".into()),
+        };
+        // XML converts a constant to the column type; JSON, SSV and
+        // PlatformBinary keep it as read.
+        let cell = match kind {
+            Kind::Xml => typed_cell(&raw.unwrap_or_default(), lexical(value).as_deref()),
+            _ => state_cell(lexical(value).as_deref()),
+        };
+        const_columns.push(json!({"id": id, "type": data_type, "index": index}));
+        constants.push((id.clone(), cell));
+    }
+    let convert = |id: &str, value: &RawValue| -> Value {
+        let Some(position) = dataset.columns.iter().position(|(column, _)| column == id) else {
+            return state_cell(lexical(value).as_deref());
+        };
+        match (kind, value) {
+            (Kind::Ssv { .. }, RawValue::Missing) => json!({"state": "missing"}),
+            (Kind::Binary, _) => state_cell(lexical(value).as_deref()),
+            _ => {
+                let decode = &column_types[position].1;
+                if decode == "TEXT_BLOB" {
+                    text_blob_cell(lexical(value).as_deref())
+                } else {
+                    typed_cell(decode, lexical(value).as_deref())
                 }
             }
         }
+    };
+    let values_of = |cells: &[(String, RawValue)], with_constants: bool| -> Map<String, Value> {
+        let mut values = Map::new();
+        // PlatformBinary rows hold only the values they carry; the other
+        // formats start every column null (SSV: missing when the record is
+        // short).
+        if kind != Kind::Binary {
+            let absent = if matches!(kind, Kind::Ssv { .. }) {
+                &RawValue::Missing
+            } else {
+                &RawValue::Null
+            };
+            for (id, _) in &dataset.columns {
+                values.insert(id.clone(), convert(id, absent));
+            }
+        }
+        if with_constants {
+            for (id, cell) in &constants {
+                values.insert(id.clone(), cell.clone());
+            }
+        }
+        // A later value for the same column replaces an earlier one.
+        for (id, value) in cells {
+            let cell = if dataset.columns.iter().any(|(column, _)| column == id) {
+                convert(id, value)
+            } else if kind == Kind::Xml {
+                typed_cell(
+                    &declared(id, true).unwrap_or_default(),
+                    lexical(value).as_deref(),
+                )
+            } else {
+                continue;
+            };
+            values.insert(id.clone(), cell);
+        }
+        values
+    };
+    let mut live = Vec::new();
+    let mut removed = Vec::new();
+    for row in dataset
+        .rows
+        .iter()
+        .filter(|row| row.row_type != RowType::Original)
+    {
+        let values = values_of(&row.values, true);
+        let mut org_row = Value::Null;
+        if row.row_type == RowType::Update {
+            if let Some(original) = &row.original {
+                let original_values = values_of(original, kind != Kind::Binary);
+                // The drivers report a saved row holding only nulls as no
+                // saved row; XML looks only at the saved cells.
+                let meaningful = match kind {
+                    Kind::Xml => original
+                        .iter()
+                        .any(|(id, value)| convert(id, value)["state"] != "null"),
+                    _ => original_values
+                        .values()
+                        .any(|cell| cell["state"] != "null" && cell["state"] != "missing"),
+                };
+                if meaningful {
+                    org_row =
+                        json!({"type": "O", "orgRow": Value::Null, "values": original_values});
+                }
+            }
+        }
+        let row_value =
+            json!({"type": row_type(row.row_type), "orgRow": org_row, "values": values});
+        if row.row_type == RowType::Delete {
+            removed.push(row_value);
+        } else {
+            live.push(row_value);
+        }
     }
-    result
+    live.extend(removed);
+    json!({"id": dataset.id, "columns": columns, "constColumns": const_columns, "rows": live})
 }
 
 fn row_type(row_type: RowType) -> &'static str {
@@ -1450,17 +1478,12 @@ fn canonical_document(value: &Value) -> Option<RawDocument> {
             ))
         })
         .collect::<Option<Vec<_>>>()?;
-    let mut datasets = object
+    let datasets = object
         .get("datasets")?
         .as_array()?
         .iter()
         .map(raw_dataset)
         .collect::<Option<Vec<_>>>()?;
-    if object.get("saveType").and_then(Value::as_u64) == Some(5) {
-        for dataset in &mut datasets {
-            dataset.rows.retain(|row| row.row_type != RowType::Normal);
-        }
-    }
     let parameter_wires = object
         .get("parameters")
         .and_then(Value::as_array)
@@ -1629,6 +1652,70 @@ fn parse_row_type(value: &str) -> Option<RowType> {
         "O" => RowType::Original,
         _ => return None,
     })
+}
+
+/// Applies the saveType selection (root, then dataset; default NORMAL = 2)
+/// as the drivers do before writing; the library writers then write the
+/// rows they get in the driver layout (saveType ALL).
+fn apply_save_types(document: &mut RawDocument, value: &Value) {
+    let root = value.get("saveType").and_then(Value::as_i64).unwrap_or(0);
+    let datasets = value.get("datasets").and_then(Value::as_array);
+    for (index, dataset) in document.datasets.iter_mut().enumerate() {
+        let mut save_type = datasets
+            .and_then(|datasets| datasets.get(index))
+            .and_then(|dataset| dataset.get("saveType"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if save_type == 0 {
+            save_type = root;
+        }
+        if save_type == 0 {
+            save_type = 2;
+        }
+        let mut rows = Vec::new();
+        for mut row in std::mem::take(&mut dataset.rows) {
+            match row.row_type {
+                RowType::Original => continue,
+                RowType::Delete => {
+                    if matches!(save_type, 1 | 4 | 5) {
+                        row.original = None;
+                        rows.push(row);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            let include = matches!(save_type, 1 | 2)
+                || matches!(save_type, 3 | 5) && row.row_type != RowType::Normal;
+            if !include {
+                continue;
+            }
+            if save_type == 2 {
+                if row.row_type == RowType::Update {
+                    if let Some(original) = row.original.take() {
+                        let mut merged: Vec<(String, RawValue)> = original
+                            .into_iter()
+                            .filter(|(_, value)| !matches!(value, RawValue::Missing))
+                            .collect();
+                        for (id, value) in row.values {
+                            if matches!(value, RawValue::Missing) {
+                                continue;
+                            }
+                            match merged.iter_mut().find(|(column, _)| *column == id) {
+                                Some(cell) => cell.1 = value,
+                                None => merged.push((id, value)),
+                            }
+                        }
+                        row.values = merged;
+                    }
+                }
+                row.row_type = RowType::Normal;
+                row.original = None;
+            }
+            rows.push(row);
+        }
+        dataset.rows = rows;
+    }
 }
 
 fn encode_result(

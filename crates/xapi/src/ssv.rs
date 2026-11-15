@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 
 use crate::{
     DecodeError, Error, Format, Limits, RawDataset, RawDocument, RawRow, RawValue, Result, RowType,
@@ -88,7 +88,8 @@ pub fn decode_raw<R: Read>(
                     .unwrap_or((descriptor.as_str(), "", false));
                 let (id, wire) = typed_name(header)?;
                 if has_value {
-                    const_columns.push((id, wire, scalar_for(value, format_profile(format))));
+                    // A constant has no null marker: the drivers keep \x03 as the character.
+                    const_columns.push((id, wire, RawValue::Text(value.to_owned())));
                 }
             }
             if let Some(current) = dataset.as_mut() {
@@ -167,125 +168,6 @@ pub fn decode_raw<R: Read>(
     Ok(document)
 }
 
-pub fn encode<W: Write>(mut output: W, document: &RawDocument, format: Format) -> Result<()> {
-    let header = "SSV:UTF-8";
-    output.write_all(header.as_bytes()).map_err(Error::from)?;
-    output.write_all(&[RS]).map_err(Error::from)?;
-    for (index, (id, value)) in document.parameters.iter().enumerate() {
-        let wire = document
-            .parameter_wires
-            .get(index)
-            .and_then(|wire| wire.as_deref())
-            .unwrap_or("STRING")
-            .to_ascii_lowercase();
-        output
-            .write_all(format!("{}:{}{}", id, wire, parameter_value(value, format)).as_bytes())
-            .map_err(Error::from)?;
-        output.write_all(&[RS]).map_err(Error::from)?;
-    }
-    for dataset in &document.datasets {
-        output
-            .write_all(format!("Dataset:{}", dataset.id).as_bytes())
-            .map_err(Error::from)?;
-        output.write_all(&[RS]).map_err(Error::from)?;
-        if !dataset.const_columns.is_empty() {
-            output.write_all(b"_Const_").map_err(Error::from)?;
-            for (id, wire, value) in dataset.const_columns.iter() {
-                let size = default_size(wire);
-                output
-                    .write_all(
-                        format!(
-                            "{}:{}({})={}",
-                            id,
-                            wire_name(wire),
-                            size,
-                            cell_value(value, format, Some(wire))
-                        )
-                        .as_bytes(),
-                    )
-                    .map_err(Error::from)?;
-            }
-            output.write_all(&[RS]).map_err(Error::from)?;
-        }
-        output.write_all(b"_RowType_").map_err(Error::from)?;
-        for (index, (id, wire)) in dataset.columns.iter().enumerate() {
-            output.write_all(&[US]).map_err(Error::from)?;
-            let size = default_size(wire);
-            let (prop, sumtext) = dataset
-                .column_meta
-                .get(index)
-                .cloned()
-                .unwrap_or((None, None));
-            let meta = match (prop, sumtext) {
-                (None, None) => String::new(),
-                (prop, sum) => format!(
-                    ":{}{}",
-                    prop.unwrap_or_default(),
-                    sum.map(|value| format!(":{value}")).unwrap_or_default()
-                ),
-            };
-            output
-                .write_all(format!("{}:{}({}){}", id, wire_name(wire), size, meta).as_bytes())
-                .map_err(Error::from)?;
-        }
-        output.write_all(&[RS]).map_err(Error::from)?;
-        for row in &dataset.rows {
-            output
-                .write_all(row_name(row.row_type).as_bytes())
-                .map_err(Error::from)?;
-            for (id, _) in &dataset.columns {
-                output.write_all(&[US]).map_err(Error::from)?;
-                output
-                    .write_all(
-                        cell_value(
-                            crate::raw_get(&row.values, id),
-                            format,
-                            Some(
-                                dataset
-                                    .columns
-                                    .iter()
-                                    .find(|(column, _)| column == id)
-                                    .map(|(_, wire)| wire)
-                                    .unwrap_or(&WireType::String),
-                            ),
-                        )
-                        .as_bytes(),
-                    )
-                    .map_err(Error::from)?;
-            }
-            output.write_all(&[RS]).map_err(Error::from)?;
-            if let Some(original) = &row.original {
-                output.write_all(b"O").map_err(Error::from)?;
-                for (id, _) in &dataset.columns {
-                    output.write_all(&[US]).map_err(Error::from)?;
-                    output
-                        .write_all(
-                            cell_value(
-                                crate::raw_get(original, id),
-                                format,
-                                Some(
-                                    dataset
-                                        .columns
-                                        .iter()
-                                        .find(|(column, _)| column == id)
-                                        .map(|(_, wire)| wire)
-                                        .unwrap_or(&WireType::String),
-                                ),
-                            )
-                            .as_bytes(),
-                        )
-                        .map_err(Error::from)?;
-                }
-                output.write_all(&[RS]).map_err(Error::from)?;
-            }
-        }
-    }
-    if !matches!(format, Format::XPlatformSsv) {
-        output.write_all(&[RS]).map_err(Error::from)?;
-    }
-    Ok(())
-}
-
 fn column(field: &str) -> Result<(String, WireType)> {
     let (id, wire) = typed_name(
         field
@@ -334,26 +216,6 @@ fn scalar(value: &str) -> RawValue {
     }
 }
 
-fn wire_name(wire: &WireType) -> String {
-    wire.to_string().to_ascii_lowercase()
-}
-
-fn default_size(wire: &WireType) -> &'static str {
-    match wire {
-        WireType::String => "32",
-        WireType::Int => "4",
-        WireType::Long => "8",
-        WireType::Float => "4",
-        WireType::Double => "8",
-        WireType::Decimal | WireType::BigDecimal => "16",
-        WireType::Boolean => "2",
-        WireType::Date => "6",
-        WireType::Time => "9",
-        WireType::DateTime => "17",
-        WireType::Blob => "256",
-    }
-}
-
 fn scalar_for(value: &str, profile: &str) -> RawValue {
     if profile == "xplatform-ssv" {
         if value == "\x02" {
@@ -373,37 +235,8 @@ fn format_profile(format: Format) -> &'static str {
         _ => "nexacro-ssv",
     }
 }
-fn parameter_value(value: &RawValue, format: Format) -> String {
-    match value {
-        RawValue::Missing => String::new(),
-        _ => format!("={}", cell_value(value, format, None)),
-    }
-}
-fn cell_value(value: &RawValue, format: Format, _wire: Option<&WireType>) -> String {
-    match value {
-        RawValue::Missing | RawValue::Null => {
-            if matches!(format, Format::XPlatformSsv) {
-                String::new()
-            } else {
-                "\x03".into()
-            }
-        }
-        RawValue::Text(value) if value.is_empty() => String::new(),
-        RawValue::Text(value) => value.clone(),
-        RawValue::Bytes(value) => String::from_utf8_lossy(value).into_owned(),
-    }
-}
 fn text(value: &[u8]) -> Result<String> {
     String::from_utf8(value.to_vec()).map_err(|_| malformed("SSV is not UTF-8"))
-}
-fn row_name(row: RowType) -> &'static str {
-    match row {
-        RowType::Normal => "N",
-        RowType::Insert => "I",
-        RowType::Update => "U",
-        RowType::Delete => "D",
-        RowType::Original => "O",
-    }
 }
 fn malformed(message: &str) -> Error {
     Error::from(DecodeError::message(message))

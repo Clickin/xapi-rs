@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 
 use crate::{
     DecodeError, Error, Limits, RawDataset, RawDocument, RawRow, RawValue, Result, RowType,
@@ -222,37 +222,47 @@ fn read_dataset(r: &mut Reader<'_>, out: &mut RawDocument, limits: Limits) -> Re
     Ok(())
 }
 
+/// A value as read: the tag and the driver lexical (bytes for BLOB tags);
+/// `None` for the null tags.
 #[derive(Clone)]
-struct Value(u16, Option<Vec<u8>>);
+struct Value(u16, Option<Vec<u8>>, Option<f64>);
 fn read_value(r: &mut Reader<'_>, tag: u16) -> Result<Value> {
     let v = match tag {
-        0 | 1 => None,
-        2 => Some((r.i32()? as i64).to_string().into_bytes()),
+        0 | 1 => return Ok(Value(tag, None, None)),
+        2 => {
+            let b = r.take(2)?;
+            let v = i16::from_be_bytes([b[0], b[1]]);
+            Some((if v != 0 { "true" } else { "false" }).as_bytes().to_vec())
+        }
         3 => Some(r.i32()?.to_string().into_bytes()),
-        4 => Some(r.f64()?.to_string().into_bytes()),
+        4 => Some(crate::driver::java_float_string(r.f64()?, 64).into_bytes()),
         21 | 40 | 26 => {
             let n = r.len()?;
             Some(r.take(n)?.to_vec())
         }
-        41 => Some((r.f64()? as i64).to_string().into_bytes()),
+        41 => {
+            let millis = r.f64()?;
+            return Ok(Value(tag, Some(Vec::new()), Some(millis)));
+        }
         _ => return Err(malformed("invalid PlatformBinary value type")),
     };
-    Ok(Value(tag, v))
+    Ok(Value(tag, v, None))
 }
+/// A variable or constant value: dates read as DATETIME.
 fn cell(v: Value) -> RawValue {
+    cell_for(v, WireType::DateTime)
+}
+/// A value read as the column type, like the drivers: a date as the column's
+/// date type, string text in a BLOB column as its bytes.
+fn cell_for(v: Value, wire: WireType) -> RawValue {
+    if let Some(millis) = v.2 {
+        return RawValue::Text(crate::driver::format_epoch(millis, &wire.to_string()));
+    }
     match v.1 {
-        None => RawValue::Text(String::new()),
+        None => RawValue::Null,
+        Some(b) if v.0 == 26 || wire == WireType::Blob && v.0 == 21 => RawValue::Bytes(b),
         Some(b) => RawValue::Text(String::from_utf8_lossy(&b).into_owned()),
     }
-}
-fn cell_for(v: Value, _wire: WireType) -> RawValue {
-    if v.0 == 26 {
-        return RawValue::Bytes(v.1.unwrap_or_default());
-    }
-    if v.0 == 0 || v.0 == 1 {
-        return RawValue::Text(String::new());
-    }
-    cell(v)
 }
 fn variant_wire(v: u16) -> WireType {
     match v {
@@ -301,180 +311,6 @@ fn row_wire(v: u16) -> RowType {
     }
 }
 
-pub fn encode<W: Write>(mut out: W, doc: &RawDocument) -> Result<()> {
-    if doc.parameters.is_empty() && doc.datasets.is_empty() {
-        return Ok(());
-    }
-    let mut vars = Vec::new();
-    put16(&mut vars, doc.parameters.len());
-    for (index, (id, value)) in doc.parameters.iter().enumerate() {
-        putstr(&mut vars, id)?;
-        let wire = doc
-            .parameter_wires
-            .get(index)
-            .and_then(Option::as_deref)
-            .unwrap_or("STRING");
-        put_typed_name(&mut vars, wire, value)?;
-    }
-    put16(&mut out, VARIABLE);
-    put16(&mut out, VERSION);
-    putlen(&mut out, vars.len());
-    out.write_all(&vars).map_err(Error::from)?;
-    fn put16<W: Write, N: TryInto<u16>>(w: &mut W, n: N) {
-        let _ = w.write_all(&n.try_into().ok().unwrap_or(u16::MAX).to_be_bytes());
-    }
-    fn putstr<W: Write>(w: &mut W, s: &str) -> Result<()> {
-        put16(w, s.len());
-        w.write_all(s.as_bytes()).map_err(Error::from)
-    }
-    fn putlen<W: Write>(w: &mut W, n: usize) {
-        put16(w, n)
-    }
-    for dataset in &doc.datasets {
-        let mut block = Vec::new();
-        putstr(&mut block, &dataset.id)?;
-        put16(&mut block, VARIABLE);
-        put16(&mut block, VERSION);
-        let mut constants = Vec::new();
-        put16(&mut constants, dataset.const_columns.len());
-        for (id, wire, value) in &dataset.const_columns {
-            putstr(&mut constants, id)?;
-            put_typed(&mut constants, *wire, value)?;
-        }
-        putlen(&mut block, constants.len());
-        block.extend(constants);
-        put16(&mut block, dataset.columns.len());
-        for (index, (id, wire)) in dataset.columns.iter().enumerate() {
-            putstr(&mut block, id)?;
-            put16(&mut block, column_code(*wire));
-            let size = dataset
-                .column_sizes
-                .get(index)
-                .and_then(Option::as_deref)
-                .and_then(|size| size.parse::<u16>().ok())
-                .unwrap_or(0);
-            put16(&mut block, size);
-            let sumtext = dataset
-                .column_meta
-                .get(index)
-                .and_then(|(_, sumtext)| sumtext.as_deref());
-            put16(&mut block, if sumtext.is_some() { 0x6000 } else { 0 });
-            if let Some(sumtext) = sumtext {
-                putstr(&mut block, sumtext)?;
-            }
-        }
-        for row in &dataset.rows {
-            let mut body = Vec::new();
-            put16(&mut body, dataset.columns.len());
-            for (id, wire) in &dataset.columns {
-                put_typed(&mut body, *wire, crate::raw_get(&row.values, id))?;
-            }
-            if row.row_type == RowType::Update {
-                let original = row.original.as_deref().unwrap_or_default();
-                put16(&mut body, dataset.columns.len());
-                for (id, wire) in &dataset.columns {
-                    put_typed(&mut body, *wire, crate::raw_get(original, id))?;
-                }
-            }
-            putlen(&mut out, body.len() + 2);
-            put16(&mut out, row_code(row.row_type));
-            out.write_all(&body).map_err(Error::from)?;
-        }
-        put16(&mut out, 0);
-        put16(&mut out, 0);
-        put16(&mut out, DATASET);
-        put16(&mut out, VERSION);
-        putlen(&mut out, block.len());
-        out.write_all(&block).map_err(Error::from)?;
-    }
-    Ok(())
-}
-fn put16<W: Write, N: TryInto<u16>>(w: &mut W, n: N) {
-    let _ = w.write_all(&n.try_into().ok().unwrap_or(u16::MAX).to_be_bytes());
-}
-fn putlen<W: Write>(w: &mut W, n: usize) {
-    put16(w, n);
-}
-fn put_typed_name<W: Write>(w: &mut W, name: &str, v: &RawValue) -> Result<()> {
-    match name.to_ascii_uppercase().as_str() {
-        "NULL" => {
-            put16(w, 0);
-            Ok(())
-        }
-        "UNDEFINED" | "DATASET" | "INVALID" => {
-            put16(w, 21);
-            put16(w, 0);
-            Ok(())
-        }
-        "INT" => put_typed(w, WireType::Int, v),
-        _ => put_typed(w, WireType::String, v),
-    }
-}
-fn put_typed<W: Write>(w: &mut W, wire: WireType, v: &RawValue) -> Result<()> {
-    if !matches!(v, RawValue::Text(_) | RawValue::Bytes(_)) {
-        put16(w, 0);
-        return Ok(());
-    }
-    let text = match v {
-        RawValue::Text(x) => x.as_bytes().to_vec(),
-        RawValue::Bytes(x) => x.clone(),
-        _ => Vec::new(),
-    };
-    match wire {
-        WireType::Blob => {
-            put16(w, 26);
-            putlen(w, text.len());
-            w.write_all(&text).map_err(Error::from)
-        }
-        WireType::Int => {
-            put16(w, 3);
-            let n = std::str::from_utf8(&text)
-                .unwrap_or("0")
-                .parse::<i32>()
-                .unwrap_or(0);
-            w.write_all(&n.to_be_bytes()).map_err(Error::from)
-        }
-        WireType::Double => {
-            put16(w, 4);
-            let n = std::str::from_utf8(&text)
-                .unwrap_or("0")
-                .parse::<f64>()
-                .unwrap_or(0.0);
-            w.write_all(&n.to_bits().to_be_bytes()).map_err(Error::from)
-        }
-        WireType::BigDecimal => {
-            put16(w, 40);
-            putlen(w, text.len());
-            w.write_all(&text).map_err(Error::from)
-        }
-        _ => {
-            put16(w, 21);
-            putlen(w, text.len());
-            w.write_all(&text).map_err(Error::from)
-        }
-    }
-}
-fn column_code(w: WireType) -> u16 {
-    match w {
-        WireType::String => 1,
-        WireType::Int => 2,
-        WireType::Double => 3,
-        WireType::BigDecimal => 4,
-        WireType::Date => 5,
-        WireType::Time => 6,
-        WireType::DateTime => 7,
-        WireType::Blob => 8,
-        _ => 1,
-    }
-}
-fn row_code(w: RowType) -> u16 {
-    match w {
-        RowType::Insert => 2,
-        RowType::Update => 4,
-        RowType::Delete => 8,
-        _ => 1,
-    }
-}
 fn malformed(s: &str) -> Error {
     Error::from(DecodeError::message(s))
 }

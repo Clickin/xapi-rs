@@ -4,8 +4,8 @@
   "Datasets": [{
     "id": "users",
     "ColumnInfo": {"Column": [
-      {"id": "id", "size": 10, "type": "INT"},
-      {"id": "name", "size": 50, "type": "STRING"}
+      {"id": "id", "size": "10", "type": "INT"},
+      {"id": "name", "size": "50", "type": "STRING"}
     ]},
     "Rows": [
       {"_RowType_": "U", "id": 42, "name": "Ada"},

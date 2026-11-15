@@ -10,7 +10,9 @@ Parameters/Datasets/Rows shape. Enable its optional `tokio` feature for a
 backpressure-preserving async-to-sync streaming bridge with cancellation and
 timeout support. Enable the `zlib` feature when PlatformZlib FFI support is
 needed. Profile-specific compatibility remains
-documented in `docs/protocol-compatibility.md`.
+documented in `docs/protocol-compatibility.md`. The encoders write the
+bytes the original XPLATFORM and Nexacro drivers write; see "Driver output"
+there.
 
 Use `Vec<Tracked<Row>>` when a dataset carries RowType or an original row;
 `XapiRow` deliberately rejects `row_type`/`org_row` field annotations so row

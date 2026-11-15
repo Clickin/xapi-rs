@@ -300,7 +300,8 @@ mod tests {
             headers[header::CONTENT_TYPE],
             "application/json; charset=utf-8"
         );
-        assert!(String::from_utf8(body).unwrap().contains("\"id\":9"));
+        // The drivers write every JSON value as a string.
+        assert!(String::from_utf8(body).unwrap().contains("\"id\":\"9\""));
     }
 
     #[test]
