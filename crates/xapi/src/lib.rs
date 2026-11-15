@@ -1009,7 +1009,7 @@ mod tests {
         let encoded = to_vec(&value, Format::XPlatformXml4000).unwrap();
         let text = String::from_utf8_lossy(&encoded);
         assert!(
-            text.contains(r#"<Root xmlns="http://www.tobesoft.com/platform/Dataset" ver="4000">"#),
+            text.contains(r#"<Root xmlns="http://www.tobesoft.com/platform/dataset" ver="5000">"#),
             "{text}"
         );
         let decoded: Response = from_slice(&encoded, Format::XPlatformXml4000).unwrap();

@@ -209,7 +209,7 @@ fn capabilities() -> Value {
     let profiles = [
         "nexacro-json-1.0",
         "nexacro-xml-4000",
-        "xplatform-xml-4000",
+        "xplatform-xml-5000",
         "nexacro-ssv",
         "xplatform-ssv",
         "nexacro-binary-5000",
@@ -236,7 +236,7 @@ fn capabilities() -> Value {
 
 fn profile_format(profile: &str) -> Option<Format> {
     Some(match profile {
-        "xplatform-xml-4000" => Format::XPlatformXml4000,
+        "xplatform-xml-5000" => Format::XPlatformXml4000,
         "nexacro-xml-4000" => Format::NexacroXml4000,
         "nexacro-json-1.0" => Format::NexacroJson10,
         "xplatform-ssv" => Format::XPlatformSsv,
@@ -268,7 +268,7 @@ fn metadata(bytes: &[u8], format: Format) -> Metadata {
             let mut metadata = xml_metadata(bytes);
             let (namespace, version, version_key) = match format {
                 Format::XPlatformXml4000 => {
-                    ("http://www.tobesoft.com/platform/Dataset", "4000", "ver")
+                    ("http://www.tobesoft.com/platform/Dataset", "5000", "ver")
                 }
                 Format::NexacroXml4000 => (
                     "http://www.nexacroplatform.com/platform/dataset",
@@ -1705,18 +1705,18 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|profile| profile["name"] == "xplatform-xml-4000"));
+            .any(|profile| profile["name"] == "xplatform-xml-5000"));
 
         let response = handle(
             &json!({
                 "operation": "encode",
-                "profile": "xplatform-xml-4000",
+                "profile": "xplatform-xml-5000",
                 "value": {"parameters": [], "datasets": []}
             })
             .to_string(),
         );
         assert_eq!(response["ok"], true);
-        assert_eq!(response["output"]["data"], "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPFJvb3QgeG1sbnM9Imh0dHA6Ly93d3cudG9iZXNvZnQuY29tL3BsYXRmb3JtL0RhdGFzZXQiIHZlcj0iNDAwMCI+Cgk8UGFyYW1ldGVycy8+CjwvUm9vdD4K");
+        assert_eq!(response["output"]["data"], "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPFJvb3QgeG1sbnM9Imh0dHA6Ly93d3cudG9iZXNvZnQuY29tL3BsYXRmb3JtL2RhdGFzZXQiIHZlcj0iNTAwMCI+Cgk8UGFyYW1ldGVycy8+CjwvUm9vdD4K");
     }
     #[test]
     fn custom_ssv_separators_decode_to_empty_canonical_value() {

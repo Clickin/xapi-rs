@@ -4,6 +4,12 @@ The runtime supports XPlatform XML 4000, Nexacro XML 4000, and Nexacro JSON
 1.0. The compatibility matrix below records the existing verified codec coverage; the conformance
 adapter additionally exposes SSV and binary profiles.
 
+`Format::XPlatformXml4000` writes the root the original XPLATFORM driver writes,
+`<Root xmlns="http://www.tobesoft.com/platform/dataset" ver="5000">`, and the
+conformance adapter exposes it as `xplatform-xml-5000`. `Format::NexacroXml4000`
+writes `<Root xmlns="http://www.nexacroplatform.com/platform/dataset">` without a
+version attribute, as the original Nexacro driver does.
+
 | Feature | XPlatform XML 4000 | Nexacro XML 4000 | Nexacro JSON 1.0 |
 |---|---|---|---|
 | Root/parameters/datasets | verified (`xmlns`, `ver`, direct `Dataset`) | verified (`xmlns`, `version`, direct `Dataset`) | verified (`version`, array `Parameters`/`Datasets`) |

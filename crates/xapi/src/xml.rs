@@ -1063,7 +1063,7 @@ pub fn encode_raw<W: Write>(
         .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
         .map_err(io_encode)?;
     let (namespace, version) = match format {
-        Format::XPlatformXml4000 => ("http://www.tobesoft.com/platform/Dataset", Some("4000")),
+        Format::XPlatformXml4000 => ("http://www.tobesoft.com/platform/dataset", Some("5000")),
         Format::NexacroXml4000 => ("http://www.nexacroplatform.com/platform/dataset", None),
         _ => unreachable!(),
     };
@@ -1299,13 +1299,10 @@ impl<W: Write> XapiEncodeSink for XmlSink<W> {
                 None,
             )))
             .map_err(io_encode)?;
-        let (namespace, version_key, version) = match self.format {
-            Format::XPlatformXml4000 => ("http://www.tobesoft.com/platform/Dataset", "ver", "4000"),
-            Format::NexacroXml4000 => (
-                "http://www.nexacroplatform.com/platform/dataset",
-                "version",
-                "4000",
-            ),
+        // Match the original drivers: XPLATFORM writes ver="5000"; Nexacro writes no version.
+        let (namespace, version) = match self.format {
+            Format::XPlatformXml4000 => ("http://www.tobesoft.com/platform/dataset", Some("5000")),
+            Format::NexacroXml4000 => ("http://www.nexacroplatform.com/platform/dataset", None),
             Format::NexacroJson10
             | Format::XPlatformSsv
             | Format::NexacroSsv
@@ -1314,7 +1311,9 @@ impl<W: Write> XapiEncodeSink for XmlSink<W> {
         };
         let mut root = BytesStart::new("Root");
         root.push_attribute(("xmlns", namespace));
-        root.push_attribute((version_key, version));
+        if let Some(version) = version {
+            root.push_attribute(("ver", version));
+        }
         self.writer
             .write_event(Event::Start(root))
             .map_err(io_encode)?;
