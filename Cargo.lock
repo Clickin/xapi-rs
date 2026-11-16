@@ -220,9 +220,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.4"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "317fafbbe3f02fc663dad00ea6186197de963cd4190e86a26d8d0fae095539af"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "pin-project-lite",
@@ -345,7 +345,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "xapi-derive"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "xapi-http"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "base64",
  "http",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "xplatform-dataset"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "base64",
  "quick-xml",
